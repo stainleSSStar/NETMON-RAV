@@ -10,6 +10,7 @@ inside the server when a poll, test, walk or SSH connection needs them; they
 are never included in API responses.
 """
 import asyncio
+import math
 import re
 import sqlite3
 import threading
@@ -22,19 +23,105 @@ from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 
 from . import db, security, snmp as snmplib, stats
-from .config import COOKIE_SECURE, DEFAULT_POLL_INTERVAL, FRONTEND_DIR, SESSION_TTL_HOURS
+from .config import (
+    COOKIE_SECURE,
+    DEFAULT_POLL_INTERVAL,
+    DISCOVERY_MAX_SECONDS,
+    FRONTEND_DIR,
+    SESSION_TTL_HOURS,
+)
 from .poller import Poller, ping, tcp_check
 from .sshtransport import handle_ssh_ws
 
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{3,32}$")
 _OID_RE = re.compile(r"^\.?\d+(\.\d+)*$")
+# A 10k-character OID parses and stores fine, then costs pysnmp an
+# ObjectIdentity build on every single poll for an OID nobody typed by hand.
+_OID_MAX_LEN = 256
+
+
+def _parse_oid(raw) -> str:
+    oid = str(raw or "").strip().lstrip(".")
+    if not _OID_RE.match(oid):
+        raise HTTPException(422, "Invalid OID (expected e.g. 1.3.6.1.2.1.1.3.0)")
+    if len(oid) > _OID_MAX_LEN:
+        raise HTTPException(422, f"OID too long (max {_OID_MAX_LEN} characters)")
+    return oid
+
+
+def _parse_finite_float(raw, field: str = "value") -> float:
+    """Parse a float, rejecting NaN and infinity.
+
+    ``float("NaN")`` and ``float("Infinity")`` both parse, and NaN passes every
+    comparison, so a range guard would not catch it. SQLite then maps NaN to
+    NULL, violating ``value REAL NOT NULL`` -> IntegrityError -> 500; and inf
+    serialises straight back into the JSON response, where Starlette's
+    ``allow_nan=False`` raises -> 500 on *every* later read of that row, which
+    silently bricks the host page with no visible cause.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(422, f"{field} must be a number")
+    if not math.isfinite(value):
+        raise HTTPException(422, f"{field} must be a finite number")
+    return value
+
+
+def _parse_bool(raw, default=None) -> bool:
+    """Interpret a JSON boolean without letting the string "false" mean True.
+
+    ``bool("false")`` is True, so a plain truthiness conversion inverts the
+    caller's intent: ``{"enabled": "false"}`` used to enable a trigger.
+    """
+    if raw is None:
+        if default is None:
+            raise HTTPException(422, "expected a boolean")
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    raise HTTPException(422, "expected a boolean (true or false)")
 
 poller = Poller()
+
+
+def _quiet_pysnmp_callback_race(loop):
+    """Stop one benign pysnmp race from printing a traceback per failed poll.
+
+    NetMon closes every ``SnmpEngine`` in a ``finally`` (see snmp.py) so the
+    dispatcher task and UDP socket cannot leak. A datagram already in flight
+    can still land after that, when pysnmp has already cleared ``_cbFun``;
+    ``DgramAsyncioProtocol.datagram_received`` then raises ``CarrierError``,
+    which the loop reports as "Unhandled exception in event loop" with a full
+    traceback — on every timed-out or unreachable SNMP host, every poll.
+
+    Only that exact exception is filtered; everything else still reaches the
+    previous handler, so real errors are not swallowed.
+    """
+    try:
+        from pysnmp.carrier.error import CarrierError
+    except Exception:  # pragma: no cover - pysnmp is a hard dependency
+        return
+    previous = loop.get_exception_handler()
+
+    def handler(active_loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, CarrierError) and "Unable to call cbFun" in str(exc):
+            return
+        if previous is not None:
+            previous(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     db.init()
+    _quiet_pysnmp_callback_race(asyncio.get_running_loop())
     await poller.start()
     yield
     await poller.stop()
@@ -414,9 +501,14 @@ def api_delete_user(user_id: int, admin=Depends(require_admin)):
     target = db.get_user(user_id)
     if not target:
         raise HTTPException(404, "User not found")
-    if target["role"] == "admin" and db.admin_count() <= 1:
-        raise HTTPException(422, "At least one administrator account must remain")
-    db.delete_user(user_id)
+    # Count and delete inside one transaction: as two steps, two concurrent
+    # requests each deleting the other admin both passed the guard.
+    try:
+        outcome = db.delete_user_guarded(user_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    if outcome == "missing":
+        raise HTTPException(404, "User not found")
     db.delete_user_sessions(user_id)
     db.add_event(None, "user_deleted", f"Account '{target['username']}' deleted",
                  actor=admin["username"])
@@ -557,10 +649,13 @@ async def api_walk_host(host_id: int, payload: dict, admin=Depends(require_admin
     if not host:
         raise HTTPException(404, "Host not found")
     host = _decrypt_host_secrets(host)
-    base = str(payload.get("oid") or "1.3.6.1.2.1").strip()
-    if not _OID_RE.match(base):
-        raise HTTPException(422, "Invalid OID")
-    result = await snmplib.snmp_walk(host, base, 250, 3.0)
+    base = _parse_oid(payload.get("oid") or "1.3.6.1.2.1")
+    # A wall-clock bound, not just a row count: an agent that answers nothing
+    # would otherwise hold this request (and the browser's spinner) open for
+    # minutes. "truncated" tells the UI the result is partial.
+    result = await snmplib.snmp_walk(
+        host, base, 250, 3.0, max_seconds=DISCOVERY_MAX_SECONDS
+    )
     return result
 
 
@@ -597,11 +692,8 @@ def api_list_oids(host_id: int, user=Depends(get_current_user)):
 def api_add_oid(host_id: int, payload: dict, admin=Depends(require_admin)):
     if not db.get_host(host_id):
         raise HTTPException(404, "Host not found")
-    oid = str(payload.get("oid") or "").strip()
+    oid = _parse_oid(payload.get("oid"))
     label = str(payload.get("label") or "").strip()[:128]
-    if not _OID_RE.match(oid):
-        raise HTTPException(422, "Invalid OID (expected e.g. 1.3.6.1.2.1.1.3.0)")
-    oid = oid.lstrip(".")
     db.add_oid(host_id, oid, label or oid)
     return {"ok": True}
 
@@ -669,8 +761,23 @@ async def api_discover_host(host_id: int, admin=Depends(require_admin)):
 def api_delete_oid(host_id: int, oid: str, admin=Depends(require_admin)):
     if not db.get_host(host_id):
         raise HTTPException(404, "Host not found")
-    db.delete_oid(host_id, oid.lstrip("."))
+    if not db.delete_oid(host_id, oid.lstrip(".")):
+        raise HTTPException(404, "OID not found for this host")
     return {"ok": True}
+
+
+def _parse_hours(hours) -> float:
+    """Validate the time window shared by uptime / series / compare.
+
+    Every comparison against NaN is False, so ``hours <= 0 or hours > 2160``
+    let NaN straight through. ``compare`` echoes the value back in its
+    response, where Starlette's ``allow_nan=False`` raises -> 500; the other
+    two silently returned an empty result instead of a 422.
+    """
+    value = _parse_finite_float(hours, "hours")
+    if value <= 0 or value > 24 * 90:
+        raise HTTPException(422, "hours must be between 0 and 2160")
+    return value
 
 
 # ------------------------------------------------------------------ charts
@@ -689,8 +796,7 @@ def api_host_status(host_id: int, user=Depends(get_current_user)):
 def api_host_uptime(host_id: int, hours: float = 24, user=Depends(get_current_user)):
     if not db.get_host(host_id):
         raise HTTPException(404, "Host not found")
-    if hours <= 0 or hours > 24 * 90:
-        raise HTTPException(422, "hours must be between 0 and 2160")
+    hours = _parse_hours(hours)
     return stats.uptime_buckets(host_id, hours)
 
 
@@ -701,8 +807,7 @@ def api_host_series(
 ):
     if not db.get_host(host_id):
         raise HTTPException(404, "Host not found")
-    if hours <= 0 or hours > 24 * 90:
-        raise HTTPException(422, "hours must be between 0 and 2160")
+    hours = _parse_hours(hours)
     max_points = max(10, min(int(max_points), 3000))
     rows = db.samples_for_oid(host_id, oid, time.time() - hours * 3600)
     if len(rows) > max_points:
@@ -745,24 +850,19 @@ def api_list_triggers(host_id: int, user=Depends(get_current_user)):
 def api_add_trigger(host_id: int, payload: dict, admin=Depends(require_admin)):
     if not db.get_host(host_id):
         raise HTTPException(404, "Host not found")
-    oid = str(payload.get("oid") or "").strip().lstrip(".")
-    if not _OID_RE.match(oid):
-        raise HTTPException(422, "Invalid OID (expected e.g. 1.3.6.1.2.1.1.3.0)")
+    oid = _parse_oid(payload.get("oid"))
     op = str(payload.get("op") or ">=")
     if op not in db.TRIGGER_OPS:
         raise HTTPException(422, f"op must be one of {', '.join(db.TRIGGER_OPS)}")
-    try:
-        value = float(payload.get("value"))
-    except (TypeError, ValueError):
-        raise HTTPException(422, "value must be a number")
+    value = _parse_finite_float(payload.get("value"))
     trigger_id = db.add_trigger(
         host_id,
         oid,
         str(payload.get("label") or "").strip()[:128] or oid,
         op,
         value,
-        delta=bool(payload.get("delta")),
-        enabled=bool(payload.get("enabled", True)),
+        delta=_parse_bool(payload.get("delta"), default=False),
+        enabled=_parse_bool(payload.get("enabled"), default=True),
     )
     db.add_event(
         host_id, "trigger_added",
@@ -781,10 +881,16 @@ def api_update_trigger(host_id: int, trigger_id: int, payload: dict,
     if "op" in payload and payload["op"] not in db.TRIGGER_OPS:
         raise HTTPException(422, f"op must be one of {', '.join(db.TRIGGER_OPS)}")
     if "value" in payload:
-        try:
-            payload["value"] = float(payload["value"])
-        except (TypeError, ValueError):
-            raise HTTPException(422, "value must be a number")
+        payload["value"] = _parse_finite_float(payload["value"])
+    # The same guards as POST, so a PATCH cannot store a NaN/inf or a
+    # stringified boolean that inverts the flag.
+    for field in ("delta", "enabled"):
+        if field in payload:
+            payload[field] = _parse_bool(payload[field])
+    if "label" in payload:
+        # POST truncates to 128; PATCH used to pass the label straight through,
+        # so a 200k-char label stored in full and came back as a 200 KB response.
+        payload["label"] = str(payload["label"] or "").strip()[:128]
     try:
         db.update_trigger(trigger_id, **{
             k: v for k, v in payload.items()
@@ -810,11 +916,8 @@ def api_delete_trigger(host_id: int, trigger_id: int,
 @app.get("/api/compare")
 def api_compare(oid: str, hours: float = 24, user=Depends(get_current_user)):
     """Cross-host comparison table for one OID."""
-    oid = (oid or "").strip().lstrip(".")
-    if not _OID_RE.match(oid):
-        raise HTTPException(422, "Invalid OID")
-    if hours <= 0 or hours > 24 * 90:
-        raise HTTPException(422, "hours must be between 0 and 2160")
+    oid = _parse_oid(oid)
+    hours = _parse_hours(hours)
     return {
         "oid": oid,
         "hours": hours,
