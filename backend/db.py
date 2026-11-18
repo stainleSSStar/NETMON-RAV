@@ -130,6 +130,28 @@ def _read_all(sql, params=()):
         return conn.execute(sql, params).fetchall()
 
 
+def has_stored_ciphertext() -> bool:
+    """Whether the database holds any encrypted credential.
+
+    Lives here rather than in ``security.py`` so the check takes the same lock
+    as every other read. ``sqlite3.Connection`` is not safe for concurrent use
+    even with ``check_same_thread=False``: the poller writes from the
+    event-loop thread while FastAPI runs sync endpoints in a threadpool, and
+    unsynchronized access raises intermittent ``InterfaceError``.
+    """
+    with _write() as conn:
+        for sql in (
+            "SELECT 1 FROM hosts"
+            " WHERE community IS NOT NULL OR v3_auth_key IS NOT NULL"
+            "   OR v3_priv_key IS NOT NULL LIMIT 1",
+            "SELECT 1 FROM ssh_credentials"
+            " WHERE password_enc IS NOT NULL LIMIT 1",
+        ):
+            if conn.execute(sql).fetchone():
+                return True
+        return False
+
+
 def _write():
     """Context manager: run writes, roll back instead of leaving a transaction open.
 
@@ -139,8 +161,18 @@ def _write():
     """
     class _Tx:
         def __enter__(self):
+            # connect() can raise (unwritable data dir, corrupt file, a lock
+            # race on the WAL pragma). __exit__ is not called when __enter__
+            # raises, so a bare acquire() would leak the RLock -- and the
+            # failing thread is normally a long-lived AnyIO pool or event-loop
+            # thread, which means every later DB call blocks forever with no
+            # error and no timeout. Release on the way out.
             _lock.acquire()
-            return connect()
+            try:
+                return connect()
+            except Exception:
+                _lock.release()
+                raise
 
         def __exit__(self, exc_type, exc, tb):
             try:
@@ -170,18 +202,69 @@ def _migrate(conn: sqlite3.Connection):
     before a column existed would keep failing every query that names it. Each
     migration is guarded by ``PRAGMA table_info`` so it runs exactly once and
     stays a no-op on a fresh database.
+
+    Both ``ALTER``s run inside one transaction: with the default
+    ``isolation_level`` SQLite executes DDL in autocommit, so without an
+    explicit ``BEGIN`` a crash between the two would leave ``hosts`` migrated
+    and ``oids`` not, and every ``oids.enabled`` query would fail until a later
+    process happened to retry.
     """
     def columns(table):
         return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
-    for table, column, ddl in (
-        ("hosts", "snmp_discovered", "INTEGER NOT NULL DEFAULT 0"),
-        ("oids", "enabled", "INTEGER NOT NULL DEFAULT 1"),
-    ):
-        if column not in columns(table):
+    pending = [
+        (table, column, ddl)
+        for table, column, ddl in (
+            ("hosts", "snmp_discovered", "INTEGER NOT NULL DEFAULT 0"),
+            ("oids", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+        )
+        if column not in columns(table)
+    ]
+    if not pending:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, column, ddl in pending:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
-    # The triggers table is new; older rows have no triggers, so nothing to
-    # backfill there.
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+# Columns NetMon's own triggers table must have.
+_TRIGGER_COLUMNS = {
+    "host_id", "oid", "label", "op", "value", "delta", "enabled",
+    "breached", "last_fired", "last_value", "created_at",
+}
+
+
+def _check_foreign_triggers_table(conn: sqlite3.Connection):
+    """Refuse to run against a ``triggers`` table NetMon did not create.
+
+    ``triggers`` is a generic name (MySQL/MariaDB expose a TRIGGERS table and
+    plenty of applications ship one), so a database pointed at this data
+    directory can already hold one with a completely different shape.
+    ``CREATE TABLE IF NOT EXISTS`` cannot reconcile it, and the index that
+    follows it in SCHEMA names columns the foreign table does not have -- and
+    ``executescript`` stops at the first failing statement. ``samples``,
+    ``events``, ``ssh_credentials`` and ``settings`` all come later in SCHEMA,
+    so they would never be created: the app would be permanently dead and
+    would blame a corrupt file. Failing here instead names the real problem.
+    """
+    rows = conn.execute("PRAGMA table_info(triggers)").fetchall()
+    if not rows:
+        return
+    have = {row["name"] for row in rows}
+    if _TRIGGER_COLUMNS <= have:
+        return
+    raise RuntimeError(
+        f"{DB_PATH} already holds a `triggers` table that NetMon did not "
+        f"create (it has {', '.join(sorted(have))}, but NetMon needs "
+        f"{', '.join(sorted(_TRIGGER_COLUMNS))}). NetMon cannot reinterpret "
+        "that data, and guessing would silently corrupt it. Move the database "
+        "aside, or point NETMON_DATA_DIR at a fresh directory."
+    )
 
 
 def connect() -> sqlite3.Connection:
@@ -201,6 +284,7 @@ def connect() -> sqlite3.Connection:
                 _conn.execute("PRAGMA journal_mode=WAL")
                 _conn.execute("PRAGMA busy_timeout=15000")
                 _conn.execute("PRAGMA foreign_keys=ON")
+                _check_foreign_triggers_table(_conn)
                 _conn.executescript(SCHEMA)
                 _migrate(_conn)
                 _conn.commit()
@@ -256,6 +340,35 @@ def get_user_by_username(username: str):
 
 def list_users():
     return _read_all("SELECT * FROM users ORDER BY id")
+
+
+def delete_user_guarded(user_id: int) -> str:
+    """Delete a user atomically, refusing to remove the last administrator.
+
+    Returns ``"deleted"`` or ``"missing"``; raises ValueError when the target is
+    the only administrator left.
+
+    The count and the delete share one ``_write()`` transaction. As two
+    separate steps, two concurrent requests -- each admin deleting the other --
+    both read ``admin_count() == 2`` and both deleted, leaving zero accounts
+    and a login page with no way back in.
+    """
+    with _write() as conn:
+        row = conn.execute(
+            "SELECT role FROM users WHERE id=?", (user_id,)).fetchone()
+        if row is None:
+            return "missing"
+        if row["role"] == "admin":
+            others = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role='admin' AND id!=?",
+                (user_id,),
+            ).fetchone()[0]
+            if others <= 0:
+                raise ValueError(
+                    "At least one administrator account must remain")
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit()
+        return "deleted"
 
 
 def delete_user(user_id: int):
@@ -414,6 +527,29 @@ def set_oid_enabled(host_id: int, oid: str, enabled: bool):
         return cur.rowcount > 0
 
 
+def delete_oid(host_id: int, oid: str) -> bool:
+    """Remove an OID together with everything derived from it.
+
+    Samples and triggers go with it. A trigger left behind would keep
+    evaluating against the last stored sample of an OID the user believes is
+    gone, and the samples would keep the table growing for an OID nobody
+    watches any more. Unlike ``set_oid_enabled`` this is a real removal: the
+    user asked for the OID to disappear, not to pause.
+
+    Returns whether a row was actually deleted, so the caller can 404.
+    """
+    with _write() as conn:
+        cur = conn.execute(
+            "DELETE FROM oids WHERE host_id=? AND oid=?", (host_id, oid))
+        removed = cur.rowcount > 0
+        conn.execute(
+            "DELETE FROM samples WHERE host_id=? AND oid=?", (host_id, oid))
+        conn.execute(
+            "DELETE FROM triggers WHERE host_id=? AND oid=?", (host_id, oid))
+        conn.commit()
+        return removed
+
+
 def host_oids(host_id: int, enabled_only: bool = False):
     sql = "SELECT * FROM oids WHERE host_id=?"
     if enabled_only:
@@ -511,11 +647,23 @@ def triggers_for_oid(host_id: int, oid: str):
 
 
 def set_trigger_state(trigger_id: int, breached: bool, value, fired_ts=None):
+    """Record a trigger's evaluation result.
+
+    ``last_fired`` is only written when ``fired_ts`` is given: clearing the
+    breach (re-arm) must not erase when the threshold last fired, which is the
+    timestamp the UI shows and ``last_trigger_ts`` aggregates.
+    """
     with _write() as conn:
-        conn.execute(
-            "UPDATE triggers SET breached=?, last_value=?, last_fired=? WHERE id=?",
-            (int(bool(breached)), value, fired_ts, trigger_id),
-        )
+        if fired_ts is None:
+            conn.execute(
+                "UPDATE triggers SET breached=?, last_value=? WHERE id=?",
+                (int(bool(breached)), value, trigger_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE triggers SET breached=?, last_value=?, last_fired=? WHERE id=?",
+                (int(bool(breached)), value, fired_ts, trigger_id),
+            )
         conn.commit()
 
 

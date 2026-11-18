@@ -44,20 +44,10 @@ def _has_stored_ciphertext() -> bool:
         if not DB_PATH.exists() or DB_PATH.stat().st_size == 0:
             return False
 
-        # db.connect() returns a process-wide singleton; never close it here.
-        conn = db.connect()
-        cur = conn.execute(
-            "SELECT 1 FROM hosts"
-            " WHERE community IS NOT NULL OR v3_auth_key IS NOT NULL"
-            "   OR v3_priv_key IS NOT NULL LIMIT 1"
-        )
-        if cur.fetchone():
-            return True
-        cur = conn.execute(
-            "SELECT 1 FROM ssh_credentials"
-            " WHERE password_enc IS NOT NULL LIMIT 1"
-        )
-        return cur.fetchone() is not None
+        # Routed through db so the SELECT takes the same lock as every other
+        # read: running it directly on the shared connection races the poller's
+        # writes and can raise InterfaceError.
+        return db.has_stored_ciphertext()
     except Exception:
         # If the database is unreadable we cannot tell; fail closed so a
         # re-key never happens by accident.

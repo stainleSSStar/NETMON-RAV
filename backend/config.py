@@ -4,6 +4,7 @@ All paths are resolved from the active data directory so the image stays
 stateless: the database, the secret key and the SSH credential cipher live in
 NETMON_DATA_DIR (mounted as a volume in docker-compose).
 """
+import math
 import os
 from pathlib import Path
 
@@ -44,6 +45,12 @@ def _env_float(name: str, default: float, minimum: float = None) -> float:
         value = float(raw)
     except ValueError:
         raise ValueError(f"{name} must be a number, got {raw!r}") from None
+    # Every comparison against NaN is False, so a NaN slips past the minimum
+    # guard below and reaches the poller, where int(timeout * 1000) raises
+    # ValueError. inf passes the same way and raises OverflowError. Reject both
+    # here rather than crashing inside a per-host poll loop.
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number, got {raw!r}")
     if minimum is not None and value < minimum:
         raise ValueError(f"{name} must be >= {minimum}, got {value}")
     return value
@@ -65,11 +72,30 @@ EVENT_RETENTION_DAYS = _env_int(
 )
 # A zero/negative TTL would make every login expire instantly, so clamp it.
 SESSION_TTL_HOURS = _env_int("NETMON_SESSION_TTL", 168, minimum=1, maximum=8760)
-COOKIE_SECURE = os.environ.get("NETMON_COOKIE_SECURE", "0") == "1"
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Read a boolean env var, accepting the spellings .env files actually use.
+
+    Comparing against "1" alone made ``true``, ``True``, ``yes`` and ``on``
+    evaluate to False -- a session cookie issued without ``Secure`` while the
+    operator believes HTTPS is enforced, with nothing in the log to say so.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+COOKIE_SECURE = _env_flag("NETMON_COOKIE_SECURE", False)
 PING_TIMEOUT = _env_float("NETMON_PING_TIMEOUT", 2.0, minimum=0.1)
 # Safety cap on first-run OID discovery. A large switch or printer can expose
 # thousands of OIDs; registering every one of them would make each poll slow
 # and the samples table huge. Everything found is stored, but polling only
 # touches the OIDs the user leaves enabled.
 DISCOVERY_MAX_OIDS = _env_int("NETMON_DISCOVERY_MAX", 2000, minimum=10, maximum=100000)
+# Wall-clock bound on the discovery walk. max_rows alone does not stop an agent
+# that answers nothing: each request then costs timeout x retries, so 2000 rows
+# is ~13 min (v2c/v3) to ~5.5 h (v1) of a task nobody can cancel.
+DISCOVERY_MAX_SECONDS = _env_float("NETMON_DISCOVERY_TIMEOUT", 120.0, minimum=5.0)
 APP_NAME = "NetMon"
