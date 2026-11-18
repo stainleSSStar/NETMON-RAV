@@ -8,6 +8,9 @@ for state.
 
 ## Install
 
+**Full install guide, including platform notes, HTTPS setup and backup:
+[INSTALL.md](INSTALL.md).**
+
 Docker is the supported way to run it — one container, one state directory.
 
 ```bash
@@ -16,11 +19,9 @@ cd NETMON-RAV
 docker compose up -d --build
 ```
 
-Then open <http://localhost:8080> and create the administrator account.
-
-**First run:** the app asks you to create the administrator account — there are
-no default credentials anywhere. Choose a username (3–32 chars: letters,
-digits, `_`, `.`, `-`) and a password of at least 10 characters.
+Then open <http://localhost:8080> and create the administrator account — there
+are no default credentials anywhere. Username 3–32 chars (letters, digits, `_`,
+`.`, `-`), password at least 10 characters.
 
 > **Never commit `data/`.** It holds `netmon.db` and `secret.key` — the Fernet key
 > that decrypts every stored SNMP community, v3 key and saved SSH password.
@@ -38,19 +39,15 @@ NETMON_UID=$(id -u) NETMON_GID=$(id -g) docker compose up -d --build
 make it permanent. On Linux, or with a named volume instead of `./data`, the
 defaults work.)
 
-**First run:** the app asks you to create the administrator account — there are
-no default credentials anywhere. Choose a username (3–32 chars: letters,
-digits, `_`, `.`, `-`) and a password of at least 10 characters.
-
 ## Features
 
 - **Uptime monitoring** per host: ICMP ping (default), TCP connect, or an SNMP
   `sysUpTime.0` query as the reachability probe. Configurable poll interval
   (10 s – 1 h).
 - **SNMP v1 / v2c / v3**: community string for v1/v2c; for v3 you get security
-  name, auth protocol (SHA/MD5/SHA224/SHA256), auth key, priv protocol
-  (AES/AES192/AES256/DES) and priv key, including noAuthNoPriv, authNoPriv and
-  authPriv.
+  name, auth protocol (MD5 / SHA / SHA224 / SHA256 / SHA384 / SHA512), auth key,
+  priv protocol (DES / 3DES / AES / AES192 / AES256) and priv key, including
+  noAuthNoPriv, authNoPriv and authPriv.
 - **Built-in OIDs** always polled: `sysUpTime`, `sysName`, `sysDescr`. Add any
   other OID manually, or **browse the agent's tree** (SNMP walk) and pick from
   what the device actually exposes.
@@ -148,11 +145,11 @@ cd NETMON-RAV
 .venv/bin/python tests/e2e_test.py        # or: python3 tests/e2e_test.py
 ```
 
-Last run: **117/117 checks passed**, 0 skipped — on a machine where raw ICMP
-sockets are permitted. On a host that forbids them the two ICMP checks are
-skipped (the ping exits with "no ICMP reply"), giving 115/117 + 2 skipped. Those
-two checks run and pass anywhere ping is allowed; the poller code path itself is
-exercised either way (the event is recorded, the host is reported down).
+Last run: **120/120 checks passed**, 2 skipped — on a machine where raw ICMP
+sockets are permitted all 122 run and pass. The two skipped checks are the ICMP
+ones: on a host that forbids raw sockets the ping exits with "no ICMP reply", so
+they skip instead of failing. The poller code path itself is exercised either way
+(the event is recorded, the host is reported down).
 
 ## Security notes
 

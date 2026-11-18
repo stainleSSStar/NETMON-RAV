@@ -1189,14 +1189,14 @@ function showHostModal(host, onSaved) {
             <label class="field"><span>Username (security name) *</span><input type="text" id="h-v3-user" class="mono" value="${esc(h.v3_user || '')}"></label>
             <label class="field"><span>Auth protocol</span>
               <select id="h-v3-auth-proto">
-                ${['SHA', 'MD5', 'SHA224', 'SHA256'].map((p) => `<option ${h.v3_auth_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
+                ${['SHA', 'MD5', 'SHA224', 'SHA256', 'SHA384', 'SHA512'].map((p) => `<option ${h.v3_auth_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
               </select></label>
             <label class="field"><span>Auth key</span>
               <input type="password" id="h-v3-auth-key" autocomplete="off"
                 placeholder="${isEdit && h.has_v3_auth ? '•••••••• (leave blank to keep)' : ''}"></label>
             <label class="field"><span>Priv protocol</span>
               <select id="h-v3-priv-proto">
-                ${['AES', 'DES', 'AES192', 'AES256'].map((p) => `<option ${h.v3_priv_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
+                ${['AES', 'AES128', 'DES', '3DES', 'AES192', 'AES256'].map((p) => `<option ${h.v3_priv_proto === p ? 'selected' : ''}>${p}</option>`).join('')}
               </select></label>
             <label class="field full"><span>Priv key</span>
               <input type="password" id="h-v3-priv-key" autocomplete="off"
