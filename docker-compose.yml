@@ -1,0 +1,24 @@
+services:
+  netmon:
+    build: .
+    image: netmon:latest
+    container_name: netmon
+    ports:
+      - "8080:8080"
+    # ICMP ping from an unprivileged user inside the container
+    cap_add:
+      - NET_RAW
+    volumes:
+      - ./data:/data
+    # The image ships an unprivileged user (uid/gid 10001). A bind mount on
+    # macOS/colima is owned by the *host* user, so override these to match it:
+    #   NETMON_UID=$(id -u) NETMON_GID=$(id -g) docker compose up -d
+    # (Linux with a local dir, or a named volume, works with the defaults.)
+    user: "${NETMON_UID:-10001}:${NETMON_GID:-10001}"
+    environment:
+      - NETMON_POLL_INTERVAL=${NETMON_POLL_INTERVAL:-60}
+      - NETMON_RETENTION_DAYS=${NETMON_RETENTION_DAYS:-30}
+      # Set to 1 when NetMon is reached over HTTPS (reverse proxy) so the
+      # session cookie gets the Secure flag.
+      - NETMON_COOKIE_SECURE=${NETMON_COOKIE_SECURE:-0}
+    restart: unless-stopped

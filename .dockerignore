@@ -1,0 +1,10 @@
+data/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+*.md
+!README.md
+.DS_Store
+data-demo/
+.demo-server.log

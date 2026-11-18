@@ -1,0 +1,329 @@
+"""Background poller: reachability checks + SNMP sampling per host.
+
+Each enabled host gets an independent asyncio task looping
+``check_host -> sleep(poll_interval)``. State transitions (up/down) are written
+to the events table, which is the single source of truth for history, uptime
+graphs and downtime periods. A maintenance task prunes old samples and expired
+sessions.
+"""
+import asyncio
+import platform
+import time
+
+from . import db, security
+from . import snmp as snmplib
+from .config import EVENT_RETENTION_DAYS, PING_TIMEOUT, SAMPLE_RETENTION_DAYS
+
+_ping_bin_missing_logged = set()
+
+
+async def ping(address: str, timeout: float = None):
+    """ICMP echo check. Returns (ok, detail); ok is None when ping is unusable."""
+    if timeout is None:
+        timeout = PING_TIMEOUT
+    is_darwin = platform.system() == "Darwin"
+    if is_darwin:  # -W is milliseconds on the BSD ping
+        cmd = ["ping", "-n", "-c", "1", "-W", str(int(timeout * 1000)), address]
+    else:  # iputils: -W is seconds
+        cmd = ["ping", "-n", "-c", "1", "-W", str(max(1, int(timeout))), address]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None, "ping binary not found"
+    try:
+        rc = await asyncio.wait_for(proc.wait(), timeout=timeout + 3)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, "timeout"
+    if rc == 0:
+        return True, "ICMP echo reply"
+    return False, f"no ICMP reply (rc={rc})"
+
+
+async def tcp_check(address: str, port: int, timeout: float = 3.0):
+    """TCP connect check. Returns (ok, latency_ms_or_None)."""
+    started = time.monotonic()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(address, port), timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return True, round((time.monotonic() - started) * 1000, 1)
+    except Exception:
+        return False, None
+
+
+class Poller:
+    def __init__(self):
+        self.tasks = {}
+        self.status = {}
+        self._last_snmp_err = {}
+        self._maint = None
+        self._stopped = False
+        self.loop = None
+
+    # ------------------------------------------------------------- lifecycle
+    async def start(self):
+        self.loop = asyncio.get_running_loop()
+        db.init()
+        for host in db.all_hosts():
+            self._init_status(host["id"])
+        for host in db.all_hosts(enabled_only=True):
+            self._spawn(host)
+        self._maint = asyncio.create_task(self._maintenance())
+
+    async def stop(self):
+        self._stopped = True
+        for task in list(self.tasks.values()):
+            await self._cancel(task)
+        self.tasks.clear()
+        if self._maint:
+            await self._cancel(self._maint)
+            self._maint = None
+
+    @staticmethod
+    async def _cancel(task):
+        """Cancel a task and await it so it cannot outlive its owner.
+
+        Without the await, a cancelled loop can still be mid-write when the
+        process exits, and asyncio logs "Task exception was never retrieved"
+        for anything that fails during cancellation.
+        """
+        if not task:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    def _init_status(self, host_id: int):
+        if host_id in self.status:
+            return
+        last = db.last_state_event(host_id)
+        if last:
+            self.status[host_id] = {
+                "up": last["type"] == "up",
+                "last_change": last["ts"],
+                "last_check": last["ts"],
+                "detail": "restored from history",
+                "latency_ms": None,
+            }
+        else:
+            self.status[host_id] = {
+                "up": None,
+                "last_change": None,
+                "last_check": None,
+                "detail": "not checked yet",
+                "latency_ms": None,
+            }
+
+    def _spawn(self, host):
+        self._init_status(host["id"])
+        old = self.tasks.pop(host["id"], None)
+        if old:
+            # Synchronous path (called from reload): request cancellation here,
+            # the loop collects it on its next tick.
+            old.cancel()
+        self.tasks[host["id"]] = asyncio.create_task(
+            self._host_loop(host["id"], host["poll_interval"])
+        )
+
+    def forget_host(self, host_id: int):
+        """Drop every trace of a host (called when it is deleted).
+
+        Otherwise `status`, the SNMP error throttle and the ping-missing flag
+        keep growing for the lifetime of the process.
+        """
+        self.status.pop(host_id, None)
+        for key in [k for k in self._last_snmp_err if k[0] == host_id]:
+            self._last_snmp_err.pop(key, None)
+        _ping_bin_missing_logged.discard(host_id)
+
+    async def reload(self, host_id: int = None):
+        """Re-read host configuration after CRUD changes."""
+        if host_id is not None:
+            old = self.tasks.pop(host_id, None)
+            if old:
+                await self._cancel(old)
+            host = db.get_host(host_id)
+            if host is None:
+                self.forget_host(host_id)
+            elif host["enabled"]:
+                self._spawn(host)
+            else:
+                self._init_status(host_id)
+            return
+        for task in list(self.tasks.values()):
+            await self._cancel(task)
+        self.tasks.clear()
+        for host in db.all_hosts(enabled_only=True):
+            self._spawn(host)
+
+    # ------------------------------------------------------------- main loop
+    async def _host_loop(self, host_id: int, interval: int):
+        while not self._stopped:
+            try:
+                await self.check_host(host_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # never let a host loop die
+                # Rate-limited like every other repetitive error: an
+                # unthrottled poll_error row per interval per host grows the
+                # events table without bound.
+                try:
+                    await self._log_once(host_id, "poll_error", f"Poller error: {exc}")
+                except Exception:
+                    pass
+            await asyncio.sleep(max(5, interval))
+
+    async def check_host(self, host_id: int):
+        host = db.get_host(host_id)
+        if not host or not host["enabled"]:
+            return
+        try:
+            host = security.decrypt_host_secrets(host)
+        except RuntimeError as exc:
+            state = self.status.setdefault(host_id, {})
+            state["detail"] = f"Credential error: {exc}"
+            await self._log_once(host_id, "poll_error", f"Credential error: {exc}")
+            return
+        started = time.monotonic()
+        method = host["check_method"]
+        if method == "tcp":
+            ok, latency = await tcp_check(host["address"], host["check_port"])
+            detail = (
+                f"TCP port {host['check_port']} open"
+                if ok
+                else f"TCP port {host['check_port']} closed or filtered"
+            )
+        elif method == "snmp":
+            result = await snmplib.snmp_get_multi(
+                host, [snmplib.SYS_UPTIME_OID]
+            )
+            ok = bool(result.get("ok"))
+            detail = (
+                "SNMP sysUpTime.0 answered"
+                if ok
+                else f"SNMP check failed: {result.get('error', 'no response')}"
+            )
+            latency = None
+        else:  # icmp
+            ok, detail = await ping(host["address"])
+            latency = None
+            if ok is None:
+                # ping unavailable (missing binary/permissions): record once and
+                # leave the state unknown instead of lying "down".
+                if host_id not in _ping_bin_missing_logged:
+                    _ping_bin_missing_logged.add(host_id)
+                    await asyncio.to_thread(
+                        db.add_event,
+                        host_id,
+                        "poll_error",
+                        "ICMP check unavailable (ping binary missing?). "
+                        "Use TCP or SNMP as check method for this host.",
+                    )
+                self.status.setdefault(host_id, {})["detail"] = detail
+                return
+
+        if latency is None:
+            latency = round((time.monotonic() - started) * 1000, 1)
+
+        state = self.status.setdefault(host_id, {})
+        previous = state.get("up")
+        now = time.time()
+        state["last_check"] = now
+        state["latency_ms"] = latency
+        state["detail"] = detail
+        if previous is None or previous != ok:
+            # Write the event *before* mutating the in-memory state: a
+            # reload()/stop() cancellation landing on the to_thread write
+            # otherwise left status ahead of the database, so a restart
+            # restored the stale state and the transition was lost.
+            if ok:
+                await asyncio.to_thread(
+                    db.add_event, host_id, "up", f"Host is reachable again ({detail})"
+                )
+            else:
+                await asyncio.to_thread(
+                    db.add_event, host_id, "down", f"Host is unreachable ({detail})"
+                )
+            state["last_change"] = now
+            state["up"] = ok
+        else:
+            state["up"] = ok
+
+        if host["snmp_enabled"]:
+            await self._sample(host)
+
+    async def _sample(self, host):
+        oids = [row["oid"] for row in db.host_oids(host["id"])]
+        oids += [oid for oid, _ in db.DEFAULT_OIDS if oid not in oids]
+        if not oids:
+            return
+        result = await snmplib.snmp_get_multi(host, oids)
+        if not result.get("ok"):
+            now = time.time()
+            if now - self._last_snmp_err.get(host["id"], 0) > 300:
+                self._last_snmp_err[host["id"]] = now
+                await asyncio.to_thread(
+                    db.add_event,
+                    host["id"],
+                    "snmp_error",
+                    f"SNMP query failed: {result.get('error', 'no response')}",
+                )
+            return
+        ts = time.time()
+        rows = [
+            (host["id"], oid, ts, text, num)
+            for oid, (text, num) in result["values"].items()
+        ]
+        await asyncio.to_thread(db.add_samples, rows)
+
+    async def _log_once(self, host_id: int, type_: str, message: str, interval: float = 300):
+        """Rate-limit repetitive error events (one per interval per host)."""
+        now = time.time()
+        key = (host_id, type_)
+        if now - self._last_snmp_err.get(key, 0) > interval:
+            self._last_snmp_err[key] = now
+            await asyncio.to_thread(db.add_event, host_id, type_, message)
+
+    # ------------------------------------------------------------- maintenance
+    async def _maintenance(self):
+        while not self._stopped:
+            try:
+                # NETMON_RETENTION_DAYS is the default; a stored setting can
+                # override it later without making the env var a silent no-op.
+                retention_days = int(
+                    db.get_setting("retention_days", SAMPLE_RETENTION_DAYS)
+                )
+                await asyncio.to_thread(
+                    db.prune_samples, time.time() - retention_days * 86400
+                )
+                # Events are the user-facing history (outages, reconnects, SSH
+                # sessions); keep them much longer than raw samples but still
+                # bound the table so a busy host cannot grow it forever.
+                event_retention_days = int(
+                    db.get_setting("event_retention_days", EVENT_RETENTION_DAYS)
+                )
+                await asyncio.to_thread(
+                    db.prune_events, time.time() - event_retention_days * 86400
+                )
+                await asyncio.to_thread(db.purge_expired_sessions)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never let one bad maintenance cycle silently disable the next.
+                print(f"[netmon] maintenance error: {exc}", flush=True)
+            await asyncio.sleep(600)

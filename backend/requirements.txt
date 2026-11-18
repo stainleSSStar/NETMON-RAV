@@ -1,0 +1,10 @@
+fastapi>=0.110,<1.0
+uvicorn[standard]>=0.29
+# 6.1.x is the pinned line: backend/snmp.py imports the native asyncio API
+# (pysnmp.hlapi.asyncio.getCmd / walkCmd / bulkWalkCmd), whose coroutine and
+# async-generator signatures changed in 6.2+/7.x. The classic sync wrapper that
+# ships in 6.1 also calls asyncio.get_event_loop(), which raises in worker
+# threads, so it is deliberately unused.
+pysnmp>=6.1,<6.2
+paramiko>=3.4
+cryptography>=42

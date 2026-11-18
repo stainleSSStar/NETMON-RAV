@@ -1,0 +1,26 @@
+# Runtime state — never commit any of this.
+# data/secret.key is the Fernet key that encrypts every stored SNMP community,
+# v3 key and saved SSH password. Committing it (especially to a public repo)
+# would expose all of them.
+data/
+data-*/
+*.db
+*.db-wal
+*.db-shm
+secret.key
+*.log
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
