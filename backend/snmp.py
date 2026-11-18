@@ -25,6 +25,7 @@ Two hard requirements shape this module:
 """
 import asyncio
 import socket
+import time
 
 from pysnmp.hlapi import (
     SnmpEngine,
@@ -61,20 +62,26 @@ SYS_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
 
 import pysnmp.hlapi as _hlapi
 
-from .config import DISCOVERY_MAX_OIDS
+from .config import DISCOVERY_MAX_OIDS, DISCOVERY_MAX_SECONDS
 
 AUTH_PROTOS = {
     "MD5": usmHMACMD5AuthProtocol,
     "SHA": usmHMACSHAAuthProtocol,
     "SHA224": getattr(_hlapi, "usmHMAC128SHA224AuthProtocol", usmHMACSHAAuthProtocol),
     "SHA256": getattr(_hlapi, "usmHMAC192SHA256AuthProtocol", usmHMACSHAAuthProtocol),
+    # One protocol OID covers HMAC-SHA-384 and HMAC-SHA-512; the key length
+    # decides which of the two is actually used on the wire.
+    "SHA384": getattr(_hlapi, "usmHMAC384SHA512AuthProtocol", usmHMACSHAAuthProtocol),
+    "SHA512": getattr(_hlapi, "usmHMAC384SHA512AuthProtocol", usmHMACSHAAuthProtocol),
 }
 
 PRIV_PROTOS = {
     "DES": usmDESPrivProtocol,
     "AES": usmAesCfb128Protocol,
+    "AES128": usmAesCfb128Protocol,
     "AES192": getattr(_hlapi, "usmAesCfb192Protocol", usmAesCfb128Protocol),
     "AES256": getattr(_hlapi, "usmAesCfb256Protocol", usmAesCfb128Protocol),
+    "3DES": getattr(_hlapi, "usm3DESEDEPrivProtocol", usmDESPrivProtocol),
 }
 
 _NON_VALUE_TYPES = ("Null", "NoSuchObject", "NoSuchInstance", "EndOfMibView")
@@ -90,12 +97,28 @@ def _auth_data(host):
         kwargs = {}
         if host.get("v3_auth_key"):
             proto_name = (host.get("v3_auth_proto") or "SHA").upper()
+            try:
+                kwargs["authProtocol"] = AUTH_PROTOS[proto_name]
+            except KeyError:
+                # Never fall back silently: a user who configured SHA-512 must
+                # not get SHA-1 on the wire without knowing.
+                raise ValueError(
+                    f"unsupported SNMPv3 auth protocol "
+                    f"{host.get('v3_auth_proto')!r} "
+                    f"(supported: {', '.join(sorted(AUTH_PROTOS))})"
+                ) from None
             kwargs["authKey"] = host["v3_auth_key"]
-            kwargs["authProtocol"] = AUTH_PROTOS.get(proto_name, usmHMACSHAAuthProtocol)
             if host.get("v3_priv_key"):
                 priv_name = (host.get("v3_priv_proto") or "AES").upper()
+                try:
+                    kwargs["privProtocol"] = PRIV_PROTOS[priv_name]
+                except KeyError:
+                    raise ValueError(
+                        f"unsupported SNMPv3 privacy protocol "
+                        f"{host.get('v3_priv_proto')!r} "
+                        f"(supported: {', '.join(sorted(PRIV_PROTOS))})"
+                    ) from None
                 kwargs["privKey"] = host["v3_priv_key"]
-                kwargs["privProtocol"] = PRIV_PROTOS.get(priv_name, usmAesCfb128Protocol)
         return UsmUserData(host.get("v3_user") or "", **kwargs)
     mp_model = 0 if version == "1" else 1
     return CommunityData(host.get("community") or "public", mpModel=mp_model)
@@ -106,19 +129,30 @@ async def _target(host, timeout, retries):
 
     ``UdpTransportTarget.__init__`` calls ``socket.getaddrinfo()`` itself; a
     slow or unreachable resolver would block the loop for the whole timeout.
-    Numeric literals resolve instantly, so this only matters for DNS names.
+    Addresses are therefore resolved off-loop first and pysnmp is handed an
+    already-numeric address.
+
+    The family is pinned to ``AF_INET`` because pysnmp's UDP transport is
+    IPv4-only — it resolves with ``AF_INET`` itself and raises
+    ``Bad IPv4/UDP transport address`` for anything else. Without the pin, a
+    dual-stack name (``localhost`` resolving to ``::1`` first) or an IPv6
+    literal made *every* SNMP call against that host fail.
     """
     address = str(host["address"]).strip().strip("[]")
     port = int(host.get("snmp_port") or 161)
     try:
         infos = await asyncio.get_running_loop().getaddrinfo(
-            address, port, type=socket.SOCK_DGRAM
+            address, port, type=socket.SOCK_DGRAM, family=socket.AF_INET
         )
         resolved = infos[0][4][0]
-    except Exception:
-        # Hand pysnmp the original name so it reports a proper timeout/error
-        # instead of us guessing; the resolver already failed off-loop.
-        resolved = address
+    except Exception as exc:
+        # Do not hand the name on to pysnmp: its constructor would call
+        # getaddrinfo() synchronously on this event loop, which is the exact
+        # freeze this helper exists to prevent. Fail here instead, where the
+        # message names the host and the reason.
+        raise RuntimeError(
+            f"cannot resolve {address!r} to an IPv4 address for SNMP: {exc}"
+        ) from exc
     return UdpTransportTarget((resolved, port), timeout=timeout, retries=retries)
 
 
@@ -173,6 +207,13 @@ async def snmp_get_multi(host: dict, oids, timeout: float = 2.5, retries: int = 
 
     Returns {"ok": True, "values": {oid: (text, num)}} or
     {"ok": False, "error": "..."} — never raises.
+
+    A single unresolvable OID does not fail the batch: pysnmp reports it as an
+    errorStatus on the whole PDU, but the other varbinds in the same response
+    are still valid. Discarding them (the old behaviour) meant one removed
+    interface cost the host every sample and every trigger evaluation, with the
+    host still rendering green. Partial answers come back with ``ok: True``,
+    ``partial: True`` and the OIDs that failed in ``failed``.
     """
     engine = SnmpEngine()
     try:
@@ -186,11 +227,31 @@ async def snmp_get_multi(host: dict, oids, timeout: float = 2.5, retries: int = 
         )
         if err_ind:
             return {"ok": False, "error": str(err_ind)}
-        if err_stat:
-            return {"ok": False, "error": f"{err_stat.prettyPrint()} (index {err_idx})"}
         values = {}
+        failed = []
         for name, val in var_binds:
-            values[str(name)] = _value_repr(val)
+            oid = str(name)
+            if type(val).__name__ in _NON_VALUE_TYPES:
+                # noSuchObject / noSuchInstance / endOfMibView: the agent does
+                # not know this instance. Keep the rest of the batch.
+                failed.append(oid)
+                continue
+            values[oid] = _value_repr(val)
+        if not values:
+            if err_stat:
+                return {"ok": False, "error": f"{err_stat.prettyPrint()} (index {err_idx})"}
+            return {"ok": False, "error": "no values returned"}
+        if err_stat or failed:
+            return {
+                "ok": True,
+                "values": values,
+                "partial": True,
+                "failed": failed,
+                "error": (
+                    f"{err_stat.prettyPrint()} (index {err_idx})" if err_stat
+                    else "some OIDs returned no value"
+                ),
+            }
         return {"ok": True, "values": values}
     except Exception as exc:  # noqa: BLE001 - surface any transport error
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -240,10 +301,24 @@ async def _probe_leaf(host: dict, oid: str, timeout: float):
         _close_engine(engine)
 
 
-async def snmp_walk(host: dict, base_oid: str, max_rows: int = 200, timeout: float = 3.0):
-    """Walk a subtree, stopping when the OID leaves the base subtree."""
+async def snmp_walk(
+    host: dict,
+    base_oid: str,
+    max_rows: int = 200,
+    timeout: float = 3.0,
+    max_seconds: float = None,
+):
+    """Walk a subtree, stopping when the OID leaves the base subtree.
+
+    ``max_seconds`` bounds the wall clock, not just the row count: an agent
+    that silently drops every request keeps a GETBULK generator alive for
+    ``max_rows / 25`` requests x ``timeout`` x retries, which for the discovery
+    walk is minutes to hours. Stopping early is reported as ``truncated`` so
+    the caller can say the result is partial.
+    """
     engine = SnmpEngine()
     rows = []
+    deadline = time.monotonic() + max_seconds if max_seconds else None
     try:
         # Users usually paste scalar OIDs ("...sysUpTime.0"). GETNEXT from a
         # leaf returns the *sibling*, so: fetch the leaf itself when it ends in
@@ -295,8 +370,10 @@ async def snmp_walk(host: dict, base_oid: str, max_rows: int = 200, timeout: flo
                     continue
                 text, _num = _value_repr(val)
                 rows.append({"oid": name_str, "value": text})
-                if len(rows) >= max_rows:
-                    return {"ok": True, "rows": rows}
+            if len(rows) >= max_rows:
+                return {"ok": True, "rows": rows, "truncated": True}
+            if deadline is not None and time.monotonic() > deadline:
+                return {"ok": True, "rows": rows, "truncated": True}
         return {"ok": True, "rows": rows}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
@@ -335,11 +412,14 @@ async def discover_oids(host: dict, max_rows: int = None):
     or {"ok": False, "error": ...}. The walk starts at the MIB root, so a real
     device returns its whole tree; ``max_rows`` (DISCOVERY_MAX_OIDS) is the
     safety cap that keeps a pathological agent from registering millions of
-    rows.
+    rows. The wall clock is bounded separately by DISCOVERY_MAX_SECONDS.
     """
     if max_rows is None:
         max_rows = DISCOVERY_MAX_OIDS
-    result = await snmp_walk(host, "1.3.6.1", max_rows=max_rows, timeout=5.0)
+    result = await snmp_walk(
+        host, "1.3.6.1", max_rows=max_rows, timeout=5.0,
+        max_seconds=DISCOVERY_MAX_SECONDS,
+    )
     if not result.get("ok"):
         return {"ok": False, "error": result.get("error", "walk failed")}
     rows = result.get("rows") or []
@@ -348,5 +428,5 @@ async def discover_oids(host: dict, max_rows: int = None):
         "ok": True,
         "oids": oids,
         "total": len(oids),
-        "capped": len(rows) >= max_rows,
+        "capped": bool(result.get("truncated")) or len(rows) >= max_rows,
     }

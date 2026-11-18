@@ -99,14 +99,15 @@ class Poller:
         self._stopped = False
         self.loop = None
         self._discovering = set()
+        self._discover_tasks = {}
 
     # ------------------------------------------------------------- lifecycle
     async def start(self):
         self.loop = asyncio.get_running_loop()
         db.init()
-        for host in db.all_hosts():
-            self._init_status(host["id"])
-        for host in db.all_hosts(enabled_only=True):
+        for host in await asyncio.to_thread(db.all_hosts):
+            await self._init_status(host["id"])
+        for host in await asyncio.to_thread(db.all_hosts, True):
             self._spawn(host)
         self._maint = asyncio.create_task(self._maintenance())
 
@@ -115,6 +116,10 @@ class Poller:
         for task in list(self.tasks.values()):
             await self._cancel(task)
         self.tasks.clear()
+        # A discovery walk can run for minutes; without this it outlives stop().
+        for task in list(self._discover_tasks.values()):
+            await self._cancel(task)
+        self._discover_tasks.clear()
         if self._maint:
             await self._cancel(self._maint)
             self._maint = None
@@ -135,10 +140,10 @@ class Poller:
         except (asyncio.CancelledError, Exception):
             pass
 
-    def _init_status(self, host_id: int):
+    async def _init_status(self, host_id: int):
         if host_id in self.status:
             return
-        last = db.last_state_event(host_id)
+        last = await asyncio.to_thread(db.last_state_event, host_id)
         if last:
             self.status[host_id] = {
                 "up": last["type"] == "up",
@@ -156,8 +161,8 @@ class Poller:
                 "latency_ms": None,
             }
 
-    def _spawn(self, host):
-        self._init_status(host["id"])
+    async def _spawn(self, host):
+        await self._init_status(host["id"])
         old = self.tasks.pop(host["id"], None)
         if old:
             # Synchronous path (called from reload): request cancellation here,
@@ -174,10 +179,20 @@ class Poller:
         keep growing for the lifetime of the process.
         """
         self.status.pop(host_id, None)
-        for key in [k for k in self._last_snmp_err if k[0] == host_id]:
+        # _last_snmp_err holds two key shapes: a bare host_id (from _sample's
+        # query-failure throttle) and a (host_id, type_) tuple (from _log_once).
+        # Indexing both as tuples raised TypeError, which aborted reload() and
+        # left the ping-missing flag and _discovering entry behind.
+        for key in [
+            k for k in self._last_snmp_err
+            if (k[0] if isinstance(k, tuple) else k) == host_id
+        ]:
             self._last_snmp_err.pop(key, None)
         _ping_bin_missing_logged.discard(host_id)
         self._discovering.discard(host_id)
+        task = self._discover_tasks.pop(host_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def reload(self, host_id: int = None):
         """Re-read host configuration after CRUD changes."""
@@ -185,19 +200,19 @@ class Poller:
             old = self.tasks.pop(host_id, None)
             if old:
                 await self._cancel(old)
-            host = db.get_host(host_id)
+            host = await asyncio.to_thread(db.get_host, host_id)
             if host is None:
                 self.forget_host(host_id)
             elif host["enabled"]:
-                self._spawn(host)
+                await self._spawn(host)
             else:
-                self._init_status(host_id)
+                await self._init_status(host_id)
             return
         for task in list(self.tasks.values()):
             await self._cancel(task)
         self.tasks.clear()
-        for host in db.all_hosts(enabled_only=True):
-            self._spawn(host)
+        for host in await asyncio.to_thread(db.all_hosts, True):
+            await self._spawn(host)
 
     # ------------------------------------------------------------- main loop
     async def _host_loop(self, host_id: int, interval: int):
@@ -217,7 +232,11 @@ class Poller:
             await asyncio.sleep(max(5, interval))
 
     async def check_host(self, host_id: int):
-        host = db.get_host(host_id)
+        # Every read goes through the same global RLock as the writers
+        # (db.py's documented invariant), so a long writer — prune_samples on a
+        # big table — would otherwise freeze this loop and the REST API with
+        # it. Thread hops are free at poll intervals.
+        host = await asyncio.to_thread(db.get_host, host_id)
         if not host or not host["enabled"]:
             return
         try:
@@ -295,12 +314,18 @@ class Poller:
         if host["snmp_enabled"]:
             if not host.get("snmp_discovered"):
                 # First successful poll on an SNMP host: learn what it exposes.
-                # Runs as its own task so a large walk cannot stall this loop.
-                asyncio.create_task(self._discover(host))
+                # Runs as its own task so a large walk cannot stall this loop,
+                # but the task is tracked so stop()/forget_host() can cancel it
+                # — an untracked one kept writing rows for a deleted host.
+                task = self._discover_tasks.get(host["id"])
+                if task is None or task.done():
+                    self._discover_tasks[host["id"]] = asyncio.create_task(
+                        self._discover(host)
+                    )
             await self._sample(host)
 
     async def _sample(self, host):
-        oids = db.enabled_oids_for_host(host["id"])
+        oids = await asyncio.to_thread(db.enabled_oids_for_host, host["id"])
         oids += [oid for oid, _ in db.DEFAULT_OIDS if oid not in oids]
         if not oids:
             return
@@ -316,6 +341,17 @@ class Poller:
                     f"SNMP query failed: {result.get('error', 'no response')}",
                 )
             return
+        if result.get("partial"):
+            # Some OIDs resolved and some did not. The good values are still
+            # stored; say which ones failed so a silently unwatched OID is not
+            # a mystery.
+            await self._log_once(
+                host["id"],
+                "snmp_error",
+                "SNMP partial response, no value for: "
+                + ", ".join(result.get("failed") or [])
+                + f" ({result.get('error', '')})",
+            )
         ts = time.time()
         rows = [
             (host["id"], oid, ts, text, num)
@@ -390,6 +426,11 @@ class Poller:
                 # Discovery failed (timeout, bad community): leave the host
                 # undiscovered so the next poll tries again.
                 return
+            # The walk can take minutes. If the host was deleted meanwhile,
+            # oids.host_id has no foreign key, so these rows would be
+            # re-inserted for a host that no longer exists and never pruned.
+            if await asyncio.to_thread(db.get_host, host_id) is None:
+                return
             rows = [
                 (oid, label, int(snmplib.is_essential_oid(oid)))
                 for oid, label in result["oids"]
@@ -412,6 +453,8 @@ class Poller:
             )
         finally:
             self._discovering.discard(host_id)
+            if self._discover_tasks.get(host_id) is asyncio.current_task():
+                self._discover_tasks.pop(host_id, None)
 
     async def _log_once(self, host_id: int, type_: str, message: str, interval: float = 300):
         """Rate-limit repetitive error events (one per interval per host)."""
@@ -428,7 +471,9 @@ class Poller:
                 # NETMON_RETENTION_DAYS is the default; a stored setting can
                 # override it later without making the env var a silent no-op.
                 retention_days = int(
-                    db.get_setting("retention_days", SAMPLE_RETENTION_DAYS)
+                    await asyncio.to_thread(
+                        db.get_setting, "retention_days", SAMPLE_RETENTION_DAYS
+                    )
                 )
                 await asyncio.to_thread(
                     db.prune_samples, time.time() - retention_days * 86400
@@ -437,7 +482,9 @@ class Poller:
                 # sessions); keep them much longer than raw samples but still
                 # bound the table so a busy host cannot grow it forever.
                 event_retention_days = int(
-                    db.get_setting("event_retention_days", EVENT_RETENTION_DAYS)
+                    await asyncio.to_thread(
+                        db.get_setting, "event_retention_days", EVENT_RETENTION_DAYS
+                    )
                 )
                 await asyncio.to_thread(
                     db.prune_events, time.time() - event_retention_days * 86400
