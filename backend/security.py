@@ -104,7 +104,20 @@ def get_fernet() -> Fernet:
                     "With a Docker bind mount on macOS, run the container as your "
                     "host user (NETMON_UID=$(id -u) NETMON_GID=$(id -g))."
                 ) from exc
-        _fernet = Fernet(key)
+        try:
+            _fernet = Fernet(key)
+        except (ValueError, TypeError) as exc:
+            # A key file that exists but is not a valid Fernet key used to
+            # escape as a raw ValueError -> HTTP 500 with a traceback, and it
+            # bypassed the careful re-key refusal above (which only checks for
+            # a *missing* file). Fail the same way instead: actionable message,
+            # no stack trace, no silent re-key.
+            raise RuntimeError(
+                f"{SECRET_KEY_PATH} is not a valid Fernet key ({exc}). It must be "
+                "32 url-safe base64-encoded bytes. Restore the original key: every "
+                "stored SNMP community, v3 key and saved SSH password is encrypted "
+                "with it and cannot be recovered otherwise."
+            ) from exc
     return _fernet
 
 

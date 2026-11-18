@@ -20,6 +20,7 @@ Hardening notes (why this file looks the way it does):
   event history never records the close.
 """
 import asyncio
+import concurrent.futures
 import json
 import threading
 import time
@@ -37,6 +38,31 @@ _READ_CHUNK = 32768
 # Each session costs a paramiko Transport plus a reader thread; cap them so one
 # admin cookie cannot exhaust the container's threads and file descriptors.
 _MAX_SSH_SESSIONS = 20
+
+# channel.sendall blocks without a timeout when the remote pty stops being
+# drained. Running it on the loop's shared default executor starves *every*
+# other to_thread caller -- new SSH connects and all db writes go through that
+# same pool -- so a couple of wedged sessions used to make the whole app unable
+# to open a terminal or record an event. Writes get their own bounded pool: a
+# stuck session can only ever stall its own input.
+_WRITE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_MAX_SSH_SESSIONS, thread_name_prefix="netmon-ssh-write")
+
+
+def _close_quietly(client):
+    """Close a paramiko client, ignoring errors.
+
+    SSHClient.connect() has no try/finally of its own: on a failed auth the
+    Transport (and its socket fd) stays referenced by the transport thread for
+    the life of the process. paramiko's Transport subclasses threading.Thread
+    with no __del__, so nothing else will ever release it.
+    """
+    if client is None:
+        return
+    try:
+        client.close()
+    except Exception:
+        pass
 
 _MIN_COLS, _MAX_COLS = 1, 500
 _MIN_ROWS, _MAX_ROWS = 1, 200
@@ -202,6 +228,7 @@ async def _run_ssh_session(websocket, host_id: int, user: dict):
         await _safe_send_text(websocket, _status(
             "error", f"SSH authentication failed: {exc}"))
         await _safe_close(websocket, 1008)
+        _close_quietly(client)
         return
 
     # Everything past a successful TCP+auth connection must run the same
@@ -278,6 +305,10 @@ async def _bridge(websocket, channel, host_id: int, username: str, actor: str):
     # Set when the pump has delivered everything, so the main loop can exit
     # promptly instead of waiting for the browser to close the socket.
     remote_done = asyncio.Event()
+    # Set by the reader when it is gone, whatever the reason. The pump watches
+    # this as well as the queue sentinel, because the sentinel itself can be
+    # dropped when the queue is full (see _put).
+    reader_done = threading.Event()
 
     def _put(data):
         try:
@@ -304,6 +335,7 @@ async def _bridge(websocket, channel, host_id: int, username: str, actor: str):
         except Exception:
             pass
         finally:
+            reader_done.set()
             if not loop.is_closed():
                 try:
                     loop.call_soon_threadsafe(_put, None)
@@ -316,7 +348,17 @@ async def _bridge(websocket, channel, host_id: int, username: str, actor: str):
     async def _pump_output():
         try:
             while True:
-                data = await output_queue.get()
+                try:
+                    data = await asyncio.wait_for(output_queue.get(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    # The sentinel is best-effort: _put drops it when the queue
+                    # is full, so also exit once the reader is gone and the
+                    # queue has drained. Without this a dropped sentinel hangs
+                    # the pump on get() forever and the session slot is never
+                    # released.
+                    if reader_done.is_set() and output_queue.empty():
+                        break
+                    continue
                 if data is None:
                     break
                 await websocket.send_bytes(data)
@@ -343,8 +385,10 @@ async def _bridge(websocket, channel, host_id: int, username: str, actor: str):
             payload = message.get("bytes")
             if payload:
                 # sendall blocks indefinitely once the remote pty stops being
-                # drained, so it must stay off the event loop.
-                await asyncio.to_thread(channel.sendall, payload)
+                # drained, so it must stay off the event loop -- and off the
+                # loop's shared executor, which every db write also uses.
+                await loop.run_in_executor(
+                    _WRITE_EXECUTOR, channel.sendall, payload)
                 continue
             text = message.get("text")
             if text:
