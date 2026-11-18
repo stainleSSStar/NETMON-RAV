@@ -177,9 +177,15 @@ def next_oids(oid: str, count: int):
     return result[:count]
 
 
+# ContextSyntax [2] IMPLICIT NULL (RFC 3416 §4.2.1) — the varbind value an
+# agent returns once a walk has run off the end of the MIB.
+END_OF_MIB_VIEW = tlv(0x82, b"")
+
+
 def build_response(request_id: int, community: str, pairs, version: int = 1):
     # VarBindList ::= SEQUENCE OF VarBind; each VarBind is itself a SEQUENCE.
-    varbind_list = b"".join(tlv(0x30, enc_oid(oid) + enc_value(oid)) for oid in pairs)
+    # ``pairs`` holds (oid, encoded value) so callers can supply endOfMibView.
+    varbind_list = b"".join(tlv(0x30, enc_oid(oid) + value) for oid, value in pairs)
     varbinds = tlv(0x30, varbind_list)
     pdu = tlv(0xA2, enc_int(request_id) + enc_int(0) + enc_int(0) + varbinds)
     # SNMPv1 messages carry version 0; echoing the request's version keeps v1
@@ -205,18 +211,33 @@ def serve(port: int, stop: threading.Event):
             print(f"parse error: {exc}", flush=True)
             continue
         if pdu_tag == 0xA0:  # GET
-            pairs = oids
+            pairs = [(oid, enc_value(oid)) for oid in oids]
         elif pdu_tag == 0xA1:  # GETNEXT
-            pairs = [next_oids(o, 1)[0] if next_oids(o, 1) else o for o in oids]
+            pairs = []
+            for oid in oids:
+                successors = next_oids(oid, 1)
+                if successors:
+                    nxt = successors[0]
+                    pairs.append((nxt, enc_value(nxt)))
+                else:
+                    # Echoing the same OID here would spin a GETNEXT walk
+                    # forever; endOfMibView ends it instead.
+                    pairs.append((oid, END_OF_MIB_VIEW))
         elif pdu_tag == 0xA5:  # GETBULK
             pairs = []
             for oid in oids:
-                pairs.extend(next_oids(oid, max(1, max_reps)))
+                successors = next_oids(oid, max(1, max_reps))
+                if successors:
+                    pairs.extend((o, enc_value(o)) for o in successors)
+                else:
+                    pairs.append((oid, END_OF_MIB_VIEW))
         else:
             print(f"unsupported pdu tag {pdu_tag:#x}", flush=True)
             continue
-        if not pairs:
-            continue
+        # Every request must be answered. Dropping the final one (the old
+        # ``if not pairs: continue``) left the client waiting for a reply that
+        # never came, which it reported as a timeout instead of a clean
+        # end-of-walk.
         sock.sendto(build_response(request_id, community, pairs, version), addr)
     sock.close()
 

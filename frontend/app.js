@@ -17,6 +17,8 @@ const state = {
   termObserver: null,
   hostStatusTimer: null,
   sshForm: {},
+  compareOid: null,
+  compareRange: 24,
 };
 
 const $app = document.getElementById('app');
@@ -187,6 +189,8 @@ function parseRoute() {
   }
   if (parts[0] === 'users') return { name: 'users' };
   if (parts[0] === 'events') return { name: 'events' };
+  if (parts[0] === 'devices') return { name: 'devices' };
+  if (parts[0] === 'compare') return { name: 'compare' };
   return { name: 'dashboard' };
 }
 
@@ -217,6 +221,8 @@ async function route() {
   if (r.name === 'ssh') return viewSSH(r.id, r.badId);
   if (r.name === 'users') return viewUsers();
   if (r.name === 'events') return viewEvents();
+  if (r.name === 'devices') return viewDevices();
+  if (r.name === 'compare') return viewCompare();
   return viewDashboard();
 }
 
@@ -232,6 +238,8 @@ function shell(content, activeNav) {
       <div class="brand">Net<span>Mon</span></div>
       <nav>
         <a href="#/" class="${activeNav === 'dashboard' ? 'active' : ''}">Dashboard</a>
+        <a href="#/devices" class="${activeNav === 'devices' ? 'active' : ''}">Devices</a>
+        <a href="#/compare" class="${activeNav === 'compare' ? 'active' : ''}">Compare</a>
         <a href="#/events" class="${activeNav === 'events' ? 'active' : ''}">Events</a>
         ${isAdmin ? '<a href="#/ssh" class="' + (activeNav === 'ssh' ? 'active' : '') + '">SSH</a>' : ''}
         ${isAdmin ? '<a href="#/users" class="' + (activeNav === 'users' ? 'active' : '') + '">Users</a>' : ''}
@@ -467,6 +475,139 @@ async function viewEvents() {
     <div class="card"><div class="event-list">${renderEvents(data.events)}</div></div>`, 'events');
 }
 
+/* ----------------------------------------------------------- devices list */
+function deviceStatusLabel(d) {
+  if (!d.enabled) return { text: 'Paused', cls: 'paused' };
+  if (d.up === true) return { text: 'Online', cls: 'up' };
+  if (d.up === false) return { text: 'Offline', cls: 'down' };
+  return { text: 'Unknown', cls: 'unknown' };
+}
+
+async function viewDevices() {
+  shell('<div class="empty">Loading…</div>', 'devices');
+  const isAdmin = state.user.role === 'admin';
+  let devices;
+  try {
+    devices = (await api('/api/devices')).devices;
+  } catch (e) { toast(e.message, 'error'); return shell('<div class="empty">Could not load devices.</div>', 'devices'); }
+
+  const online = devices.filter((d) => d.up === true).length;
+  const offline = devices.filter((d) => d.up === false).length;
+  const alerts = devices.reduce((n, d) => n + d.triggers_breached, 0);
+
+  shell(`
+    <div class="page-head">
+      <div><h1>Devices</h1><div class="sub">${devices.length} host${devices.length === 1 ? '' : 's'} · ${online} online · ${offline} offline${alerts ? ` · ${alerts} trigger${alerts === 1 ? '' : 's'} breached` : ''}</div></div>
+      ${isAdmin ? '<button class="primary" data-act="add-host">+ Add host</button>' : ''}
+    </div>
+    ${alerts ? `<div class="notice red">${alerts} device${alerts === 1 ? '' : 's'} currently ${alerts === 1 ? 'has' : 'have'} a breached trigger. Open the device to see which value crossed its threshold.</div>` : ''}
+    <div class="card">
+      <table class="data">
+        <tr><th>Status</th><th>Name</th><th>Address</th><th>Check</th><th>Last check</th>
+          <th>Latency</th><th>24h availability</th><th>OIDs</th><th>Triggers</th><th>History</th><th>Config</th></tr>
+        ${devices.map((d) => {
+          const st = deviceStatusLabel(d);
+          const a = d.availability_24h || {};
+          return `
+          <tr>
+            <td><span class="dot ${st.cls}" title="${st.text}"></span> ${st.text}</td>
+            <td><b>${esc(d.name)}</b>${!d.enabled ? ' <span class="badge">paused</span>' : ''}${d.snmp_enabled ? '' : ' <span class="badge">no SNMP</span>'}</td>
+            <td class="mono">${esc(d.address)}</td>
+            <td>${esc(d.check_method)}</td>
+            <td>${fmtAgo(d.last_check)}</td>
+            <td>${d.latency_ms != null ? d.latency_ms + ' ms' : '—'}</td>
+            <td>${a.availability_pct == null ? '—' : a.availability_pct.toFixed(2) + '%'}</td>
+            <td>${d.oids_enabled}/${d.oids_total}${d.snmp_enabled && !d.snmp_discovered ? ' <span class="badge">discovering</span>' : ''}</td>
+            <td>${d.triggers_total
+                ? `${d.triggers_total}${d.triggers_breached ? ` <span class="badge breach">${d.triggers_breached} breached</span>` : ''}`
+                : '—'}</td>
+            <td><a href="#/host/${d.id}">History</a></td>
+            <td><a href="#/host/${d.id}">Configure</a></td>
+          </tr>`;
+        }).join('') || '<tr><td colspan="11"><div class="empty">No hosts yet. Add your first host to start monitoring.</div></td></tr>'}
+      </table>
+    </div>
+    <div class="hint">Each device keeps its own history: reachability transitions, every SNMP sample and every trigger breach.
+      Open a device to chart its values, switch individual OIDs on or off, and define triggers.</div>`, 'devices');
+
+  const addBtn = $app.querySelector('[data-act="add-host"]');
+  if (addBtn) addBtn.addEventListener('click', () => showHostModal(null, reloadRoute));
+}
+
+/* ----------------------------------------------------------- comparison */
+async function viewCompare() {
+  shell('<div class="empty">Loading…</div>', 'compare');
+  const hours = state.compareRange || 24;
+  let oidList;
+  try {
+    oidList = (await api('/api/compare/oids')).oids;
+  } catch (e) { toast(e.message, 'error'); return shell('<div class="empty">Could not load OIDs.</div>', 'compare'); }
+
+  const oid = state.compareOid || (oidList[0] && oidList[0].oid) || '';
+  const label = (oidList.find((o) => o.oid === oid) || {}).label || oid;
+
+  shell(`
+    <div class="page-head">
+      <div><h1>Compare devices</h1><div class="sub">One metric, every device that reports it — side by side</div></div>
+    </div>
+    <div class="card">
+      <div class="btnrow" style="align-items:flex-end;gap:10px">
+        <label class="field" style="min-width:280px"><span>OID</span>
+          <select id="cmp-oid">
+            ${oidList.map((o) => `<option value="${esc(o.oid)}" ${o.oid === oid ? 'selected' : ''}>${esc(o.label || o.oid)} — ${o.hosts} host${o.hosts === 1 ? '' : 's'}</option>`).join('')
+              || '<option value="">No OIDs registered yet</option>'}
+          </select>
+        </label>
+        <span class="seg">
+          ${[1, 6, 24, 168, 720].map((h) => `<button data-crange="${h}" class="${hours === h ? 'active' : ''}">${h === 1 ? '1h' : h === 6 ? '6h' : h === 24 ? '24h' : h === 168 ? '7d' : '30d'}</button>`).join('')}
+        </span>
+      </div>
+      <div class="hint" style="margin-top:8px">Only devices that actually sample this OID appear. Enable an OID on a device to include it in the comparison.</div>
+      <div id="cmp-out"><div class="empty">Loading…</div></div>
+    </div>`, 'compare');
+
+  const out = $app.querySelector('#cmp-out');
+  const load = async () => {
+    if (!oid) { out.innerHTML = '<div class="empty">Nothing to compare yet — add a host and let discovery find some OIDs.</div>'; return; }
+    out.innerHTML = '<div class="empty">Loading…</div>';
+    try {
+      const data = await api(`/api/compare?oid=${encodeURIComponent(oid)}&hours=${state.compareRange || 24}`);
+      if (!data.rows.length) {
+        out.innerHTML = `<div class="empty">No samples for <span class="mono">${esc(oid)}</span> in this window.</div>`;
+        return;
+      }
+      out.innerHTML = `
+        <table class="data">
+          <tr><th>Device</th><th>Address</th><th>Current</th><th>Min</th><th>Max</th><th>Average</th>
+            <th>Samples</th><th>Downtimes</th><th>Trigger breaches</th><th>Last breach</th></tr>
+          ${data.rows.map((r) => `
+            <tr class="${r.last_breach ? 'trig-breached' : ''}">
+              <td><a href="#/host/${r.host_id}"><b>${esc(r.name)}</b></a></td>
+              <td class="mono">${esc(r.address)}</td>
+              <td class="mono"><b>${r.current == null ? '—' : esc(r.current)}</b></td>
+              <td class="mono">${r.min == null ? '—' : esc(String(r.min))}</td>
+              <td class="mono">${r.max == null ? '—' : esc(String(r.max))}</td>
+              <td class="mono">${r.avg == null ? '—' : esc(String(r.avg))}</td>
+              <td>${r.points}</td>
+              <td>${r.downs || '—'}</td>
+              <td>${r.alerts || '—'}</td>
+              <td>${r.last_breach ? fmtTs(r.last_breach, true) : '—'}</td>
+            </tr>`).join('')}
+        </table>`;
+    } catch (e) {
+      out.innerHTML = `<div class="empty">Error: ${esc(e.message)}</div>`;
+    }
+  };
+
+  $app.querySelectorAll('[data-crange]').forEach((btn) => btn.addEventListener('click', () => {
+    state.compareRange = parseInt(btn.dataset.crange, 10);
+    route();
+  }));
+  const sel = $app.querySelector('#cmp-oid');
+  if (sel) sel.addEventListener('change', () => { state.compareOid = sel.value; load(); });
+  await load();
+}
+
 /* ----------------------------------------------------------- host detail */
 async function viewHost(id) {
   if (!Number.isInteger(id)) { location.hash = '#/'; return; }
@@ -485,13 +626,14 @@ async function viewHost(id) {
         host = (await api('/api/hosts/' + id)).host;
       } catch (e) { toast(e.message, 'error'); location.hash = '#/'; return; }
     }
-    let status, uptime, oids, events;
+    let status, uptime, oids, events, triggers;
     try {
-      [status, uptime, oids, events] = await Promise.all([
+      [status, uptime, oids, events, triggers] = await Promise.all([
         api(`/api/hosts/${id}/status`),
         api(`/api/hosts/${id}/uptime?hours=${state.hostRange || 24}`),
         api(`/api/hosts/${id}/oids`),
         api(`/api/hosts/${id}/events?limit=60`),
+        api(`/api/hosts/${id}/triggers`),
       ]);
     } catch (e) {
       // One failed sub-request must not leave the page stuck on "Loading…".
@@ -568,13 +710,25 @@ async function viewHost(id) {
 
       <div class="section">
         <h2>SNMP values
-          ${isAdmin ? '<span class="tools"><button class="small" data-act="add-oid">+ Add OID</button><button class="small" data-act="walk">Browse OIDs</button></span>' : ''}
+          ${isAdmin ? '<span class="tools"><button class="small" data-act="add-oid">+ Add OID</button><button class="small" data-act="discover">Discover all</button><button class="small" data-act="walk">Browse OIDs</button></span>' : ''}
         </h2>
+        <div class="hint" style="margin-top:-6px;margin-bottom:10px">
+          ${host.snmp_enabled
+            ? (() => {
+                const found = oids.oids.filter((o) => !o.builtin).length;
+                const polling = oids.oids.filter((o) => o.enabled && !o.builtin).length;
+                return `Discovery found <b>${found}</b> OID${found === 1 ? '' : 's'} on this device; <b>${polling}</b> ${polling === 1 ? 'is' : 'are'} being polled. Tick an OID to start or stop collecting it — history is kept either way.`;
+              })()
+            : 'SNMP is disabled for this host, so no values are collected.'}
+        </div>
         <div class="card">
           <table class="data">
-            <tr><th>OID</th><th>Label</th><th>Last value</th><th>Updated</th><th>Chart</th>${isAdmin ? '<th></th>' : ''}</tr>
+            <tr><th>On</th><th>OID</th><th>Label</th><th>Last value</th><th>Updated</th><th>Chart</th>${isAdmin ? '<th></th>' : ''}</tr>
             ${oids.oids.map((o) => `
-              <tr>
+              <tr class="${o.enabled ? '' : 'oid-off'}">
+                <td>${o.builtin ? '<span class="badge">always</span>' : (isAdmin
+                  ? `<input type="checkbox" class="oid-toggle" data-oid="${esc(o.oid)}" ${o.enabled ? 'checked' : ''} title="${o.enabled ? 'Stop collecting this value' : 'Start collecting this value'}">`
+                  : (o.enabled ? '✓' : '—'))}</td>
                 <td class="mono">${esc(o.oid)}</td>
                 <td>${esc(o.label)}${o.builtin ? ' <span class="badge">built-in</span>' : ''}</td>
                 <td class="mono">${o.last_value == null ? '—' : esc(o.last_value)}</td>
@@ -591,6 +745,38 @@ async function viewHost(id) {
             <span class="hint">Tick OIDs above, then plot. Numeric values (counters, gauges, TimeTicks) are charted; strings appear as gaps.</span>
           </div>
           <div class="chart-wrap tall" style="margin-top:10px"><canvas id="series-chart"></canvas></div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h2>Triggers
+          ${isAdmin ? '<span class="tools"><button class="small" data-act="add-trigger">+ Add trigger</button></span>' : ''}
+        </h2>
+        <div class="hint" style="margin-top:-6px;margin-bottom:10px">
+          Thresholds you define yourself — none exist until you add one. A trigger fires the moment a polled value crosses your rule and writes to this host's history and the event log.
+          Use <b>delta</b> to alert on how much a value changed since the previous poll (e.g. “pages jumped by 500”) rather than on its absolute level.
+        </div>
+        <div class="card">
+          ${triggers.triggers.length ? `
+            <table class="data">
+              <tr><th>On</th><th>OID</th><th>Label</th><th>Rule</th><th>State</th><th>Last fired</th>${isAdmin ? '<th></th>' : ''}</tr>
+              ${triggers.triggers.map((t) => `
+                <tr class="${t.breached ? 'trig-breached' : ''}">
+                  <td>${isAdmin
+                    ? `<input type="checkbox" class="trig-toggle" data-trig="${t.id}" ${t.enabled ? 'checked' : ''} title="${t.enabled ? 'Disable this trigger' : 'Enable this trigger'}">`
+                    : (t.enabled ? '✓' : '—')}</td>
+                  <td class="mono">${esc(t.oid)}</td>
+                  <td>${esc(t.label)}</td>
+                  <td class="mono">${t.delta ? 'Δ' : ''} ${esc(t.op)} ${esc(String(t.value))}</td>
+                  <td>${t.breached
+                    ? '<span class="badge breach">breached</span>'
+                    : (t.enabled ? '<span class="badge">watching</span>' : '<span class="badge">off</span>')}</td>
+                  <td>${t.last_fired ? fmtTs(t.last_fired, true) : '—'}</td>
+                  ${isAdmin ? `<td>
+                    <button class="small" data-edit-trig="${t.id}">Edit</button>
+                    <button class="small danger" data-del-trig="${t.id}">Delete</button></td>` : ''}
+                </tr>`).join('')}
+            </table>` : '<div class="empty">No triggers yet. Add one to be alerted when a value crosses a threshold.</div>'}
         </div>
       </div>
 
@@ -770,6 +956,125 @@ function bindHostActions(host, render) {
     await api(`/api/hosts/${host.id}/oids/${encodeURIComponent(btn.dataset.delOid)}`, { method: 'DELETE' });
     toast('OID removed', 'success');
     render();
+  }));
+
+  // Enable/disable collection per OID. Optimistic: the toggle flips at once
+  // and is rolled back if the server rejects it, so the checkbox never lies.
+  $app.querySelectorAll('.oid-toggle').forEach((box) => box.addEventListener('change', async () => {
+    const oid = box.dataset.oid;
+    const next = box.checked;
+    box.disabled = true;
+    try {
+      await api(`/api/hosts/${host.id}/oids/${encodeURIComponent(oid)}`, {
+        method: 'PATCH', body: { enabled: next },
+      });
+      toast(next ? `Collecting ${oid}` : `Stopped collecting ${oid} — history kept`, 'success');
+      render();
+    } catch (e) {
+      box.checked = !next;
+      toast(e.message, 'error');
+    } finally {
+      box.disabled = false;
+    }
+  }));
+
+  bind('discover', () => {
+    openModal({
+      title: `Discover OIDs — ${host.name}`,
+      body: `<p>Walk the device and register every OID it exposes.</p>
+        <p>Everything found is stored, but only the essentials (system group and
+        interface status) are switched on, so polling stays fast. You can turn
+        any of the rest on afterwards from the SNMP values table.</p>
+        <div class="hint">Re-running this is safe: it only adds new OIDs and never
+        changes the ones you have already enabled or disabled.</div>`,
+      confirmLabel: 'Discover',
+      onConfirm: async () => {
+        const res = await api(`/api/hosts/${host.id}/discover`, { method: 'POST' });
+        toast(`Discovered ${res.discovered} OIDs, ${res.enabled} enabled`
+              + (res.capped ? ' (hit the discovery cap)' : ''), 'success');
+        render();
+      },
+    });
+  });
+
+  // ---------------------------------------------------------------- triggers
+  const trigModal = (existing) => {
+    const known = oids.oids.filter((o) => !o.builtin).map((o) => o.oid);
+    const all = [...new Set([...known, ...triggers.triggers.map((t) => t.oid)])];
+    openModal({
+      title: existing ? 'Edit trigger' : 'Add trigger',
+      body: `
+        <label class="field"><span>OID</span>
+          <input type="text" id="trig-oid" class="mono" list="trig-oid-list"
+                 value="${esc(existing ? existing.oid : '')}" placeholder="1.3.6.1.2.1.43.10.2.1.4.1.1">
+        </label>
+        <datalist id="trig-oid-list">${all.map((o) => `<option value="${esc(o)}">`).join('')}</datalist>
+        <label class="field"><span>Label</span>
+          <input type="text" id="trig-label" value="${esc(existing ? existing.label : '')}" placeholder="Printer page count">
+        </label>
+        <div class="field-row">
+          <label class="field"><span>When value is</span>
+            <select id="trig-op">
+              ${['>', '>=', '<', '<=', '==', '!='].map((op) =>
+                `<option ${existing && existing.op === op ? 'selected' : ''}>${op}</option>`).join('')}
+            </select>
+          </label>
+          <label class="field"><span>Threshold</span>
+            <input type="number" id="trig-value" step="any" value="${existing ? esc(String(existing.value)) : ''}" placeholder="50000">
+          </label>
+        </div>
+        <label class="check"><input type="checkbox" id="trig-delta" ${existing && existing.delta ? 'checked' : ''}>
+          <span>Fire on the <b>change</b> since the previous poll (delta) instead of the absolute value</span></label>
+        <label class="check"><input type="checkbox" id="trig-enabled" ${!existing || existing.enabled ? 'checked' : ''}>
+          <span>Enabled</span></label>`,
+      onConfirm: async (backdrop) => {
+        const body = {
+          oid: backdrop.querySelector('#trig-oid').value.trim(),
+          label: backdrop.querySelector('#trig-label').value.trim(),
+          op: backdrop.querySelector('#trig-op').value,
+          value: backdrop.querySelector('#trig-value').value,
+          delta: backdrop.querySelector('#trig-delta').checked,
+          enabled: backdrop.querySelector('#trig-enabled').checked,
+        };
+        if (existing) {
+          await api(`/api/hosts/${host.id}/triggers/${existing.id}`, { method: 'PATCH', body });
+        } else {
+          await api(`/api/hosts/${host.id}/triggers`, { method: 'POST', body });
+        }
+        toast(existing ? 'Trigger updated' : 'Trigger added', 'success');
+        render();
+      },
+    });
+  };
+
+  bind('add-trigger', () => trigModal(null));
+  $app.querySelectorAll('[data-edit-trig]').forEach((btn) => btn.addEventListener('click', () => {
+    const t = triggers.triggers.find((x) => String(x.id) === btn.dataset.editTrig);
+    if (t) trigModal(t);
+  }));
+  $app.querySelectorAll('[data-del-trig]').forEach((btn) => btn.addEventListener('click', async () => {
+    const t = triggers.triggers.find((x) => String(x.id) === btn.dataset.delTrig);
+    openModal({
+      title: 'Delete trigger?',
+      body: `<p>“${esc(t ? t.label : '')}” will stop watching this value. Recorded history is not affected.</p>`,
+      confirmLabel: 'Delete',
+      onConfirm: async () => {
+        await api(`/api/hosts/${host.id}/triggers/${btn.dataset.delTrig}`, { method: 'DELETE' });
+        toast('Trigger deleted', 'success');
+        render();
+      },
+    });
+  }));
+  $app.querySelectorAll('.trig-toggle').forEach((box) => box.addEventListener('change', async () => {
+    const next = box.checked;
+    try {
+      await api(`/api/hosts/${host.id}/triggers/${box.dataset.trig}`,
+                { method: 'PATCH', body: { enabled: next } });
+      render();
+    } catch (e) {
+      box.checked = !next;
+      toast(e.message, 'error');
+    }
   }));
 
   const plot = $app.querySelector('[data-act="plot"]');

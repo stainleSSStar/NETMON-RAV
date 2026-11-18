@@ -54,6 +54,28 @@ digits, `_`, `.`, `-`) and a password of at least 10 characters.
 - **Built-in OIDs** always polled: `sysUpTime`, `sysName`, `sysDescr`. Add any
   other OID manually, or **browse the agent's tree** (SNMP walk) and pick from
   what the device actually exposes.
+- **First-run discovery**: the first time an SNMP host answers, NetMon walks the
+  device and registers **every** OID it exposes. Only the essentials (the system
+  group and interface status) are switched on, so polling stays fast; everything
+  else is stored ready to be enabled with one tick. Re-running discovery only
+  ever adds — it never overrides a choice you already made.
+- **Per-OID collection switches**: tick any OID on or off at any time. Turning
+  one off stops sampling it but keeps its configuration and its entire history,
+  so it can be switched back on later without losing anything.
+- **Triggers**: thresholds you define yourself — none exist until you create
+  one. Fire when a polled value crosses an absolute level (`>=`, `>`, `<=`,
+  `<`, `==`, `!=`) or on how much it changed since the previous poll (delta),
+  which is what you want for counters like printer page counts. A trigger fires
+  on the transition into the breached state, writes to that device's history and
+  the event log, and re-arms when the value leaves it — so a printer sitting
+  above its limit does not write an event on every poll.
+- **Devices page**: the full inventory in one table — name, address, online /
+  offline / paused, last check, latency, 24 h availability, how many OIDs are
+  being collected, and how many triggers are breached, with links straight to
+  each device's history and configuration.
+- **Compare devices**: pick one OID and see it side by side across every device
+  that reports it — current value, min / max / average over the window, number
+  of samples, downtime count, trigger breaches and when the last one fired.
 - **Charts**: uptime availability per 5 min / hour / day bucket for the last
   24 h / 7 d / 30 d, plus line charts for any selected numeric OID values
   (counters, gauges, TimeTicks are converted to numbers).
@@ -100,6 +122,7 @@ Environment variables (optional):
 | `NETMON_SESSION_TTL`     | `168`   | Session lifetime in hours                 |
 | `NETMON_COOKIE_SECURE`   | `0`     | Set `1` when serving over HTTPS           |
 | `NETMON_PING_TIMEOUT`    | `2.0`   | ICMP probe timeout in seconds             |
+| `NETMON_DISCOVERY_MAX`   | `2000`  | Safety cap on OIDs registered per host by first-run discovery |
 | `NETMON_UID` / `NETMON_GID` | `10001` | Container user for the `./data` volume |
 
 Any of these can also be set in a `.env` file next to `docker-compose.yml`.
@@ -124,11 +147,11 @@ cd NETMON-RAV
 .venv/bin/python tests/e2e_test.py        # or: python3 tests/e2e_test.py
 ```
 
-Last run: **79/79 checks passed**, 2 skipped — the two ICMP checks, because the
-machine that produced this build forbids raw ICMP sockets (the ping exits with
-"no ICMP reply"). Those two checks run and pass anywhere ping is permitted; the
-poller code path itself is exercised either way (the event is recorded, the host
-is reported down).
+Last run: **117/117 checks passed**, 0 skipped — on a machine where raw ICMP
+sockets are permitted. On a host that forbids them the two ICMP checks are
+skipped (the ping exits with "no ICMP reply"), giving 115/117 + 2 skipped. Those
+two checks run and pass anywhere ping is allowed; the poller code path itself is
+exercised either way (the event is recorded, the host is reported down).
 
 ## Security notes
 

@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS hosts (
   poll_interval INTEGER NOT NULL DEFAULT 60,
   enabled INTEGER NOT NULL DEFAULT 1,
   notes TEXT,
+  snmp_discovered INTEGER NOT NULL DEFAULT 0,
   created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS oids (
@@ -57,9 +58,25 @@ CREATE TABLE IF NOT EXISTS oids (
   host_id INTEGER NOT NULL,
   oid TEXT NOT NULL,
   label TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
   created_at REAL NOT NULL,
   UNIQUE(host_id, oid)
 );
+CREATE TABLE IF NOT EXISTS triggers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  host_id INTEGER NOT NULL,
+  oid TEXT NOT NULL,
+  label TEXT NOT NULL,
+  op TEXT NOT NULL,
+  value REAL NOT NULL,
+  delta INTEGER NOT NULL DEFAULT 0,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  breached INTEGER NOT NULL DEFAULT 0,
+  last_fired REAL,
+  last_value REAL,
+  created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_triggers_host ON triggers(host_id);
 CREATE TABLE IF NOT EXISTS samples (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   host_id INTEGER NOT NULL,
@@ -146,6 +163,27 @@ _DATA_DIR_HINT = (
 )
 
 
+def _migrate(conn: sqlite3.Connection):
+    """Bring pre-existing databases up to the current schema.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot add a column, so a database created
+    before a column existed would keep failing every query that names it. Each
+    migration is guarded by ``PRAGMA table_info`` so it runs exactly once and
+    stays a no-op on a fresh database.
+    """
+    def columns(table):
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+    for table, column, ddl in (
+        ("hosts", "snmp_discovered", "INTEGER NOT NULL DEFAULT 0"),
+        ("oids", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if column not in columns(table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    # The triggers table is new; older rows have no triggers, so nothing to
+    # backfill there.
+
+
 def connect() -> sqlite3.Connection:
     global _conn
     with _lock:
@@ -164,6 +202,7 @@ def connect() -> sqlite3.Connection:
                 _conn.execute("PRAGMA busy_timeout=15000")
                 _conn.execute("PRAGMA foreign_keys=ON")
                 _conn.executescript(SCHEMA)
+                _migrate(_conn)
                 _conn.commit()
             except sqlite3.DatabaseError as exc:
                 # A corrupt or non-SQLite file must not leave a half-open
@@ -321,34 +360,258 @@ def all_hosts(enabled_only: bool = False):
 
 def delete_host(host_id: int):
     with _write() as conn:
-        for table in ("oids", "samples", "events", "ssh_credentials"):
+        for table in ("oids", "samples", "events", "ssh_credentials", "triggers"):
             conn.execute(f"DELETE FROM {table} WHERE host_id=?", (host_id,))
         conn.execute("DELETE FROM hosts WHERE id=?", (host_id,))
         conn.commit()
 
 
 # ---------------------------------------------------------------- oids
-def add_oid(host_id: int, oid: str, label: str):
+def add_oid(host_id: int, oid: str, label: str, enabled: int = 1):
+    """Register an OID the user explicitly asked to monitor.
+
+    Unlike discovery, an explicit add is a statement of intent, so it also sets
+    ``enabled``: adding an OID that first-run discovery found and left switched
+    off must actually start polling it, not silently change only its label.
+    """
     with _write() as conn:
-        # Upsert: re-adding a known OID with a new label must update it,
-        # otherwise the UI reports success and nothing changes.
         conn.execute(
-            """INSERT INTO oids(host_id, oid, label, created_at) VALUES (?,?,?,?)
-               ON CONFLICT(host_id, oid) DO UPDATE SET label=excluded.label""",
-            (host_id, oid, label, time.time()),
+            """INSERT INTO oids(host_id, oid, label, enabled, created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(host_id, oid) DO UPDATE SET
+                   label=excluded.label, enabled=excluded.enabled""",
+            (host_id, oid, label, int(enabled), time.time()),
         )
         conn.commit()
 
 
-def delete_oid(host_id: int, oid: str):
+def add_oids_bulk(host_id: int, rows):
+    """Register many OIDs at once (first-run discovery).
+
+    ``rows`` is an iterable of (oid, label, enabled). Existing rows keep their
+    ``enabled`` flag — discovery must never override a choice the user already
+    made, otherwise re-walking a device would undo every manual toggle.
+    """
+    now = time.time()
     with _write() as conn:
-        conn.execute("DELETE FROM oids WHERE host_id=? AND oid=?", (host_id, oid))
+        conn.executemany(
+            """INSERT INTO oids(host_id, oid, label, enabled, created_at)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(host_id, oid) DO UPDATE SET label=excluded.label""",
+            [(host_id, oid, label, int(enabled), now) for oid, label, enabled in rows],
+        )
         conn.commit()
 
 
-def host_oids(host_id: int):
+def set_oid_enabled(host_id: int, oid: str, enabled: bool):
+    """Toggle polling for one OID without deleting its config or history."""
+    with _write() as conn:
+        cur = conn.execute(
+            "UPDATE oids SET enabled=? WHERE host_id=? AND oid=?",
+            (int(bool(enabled)), host_id, oid),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def host_oids(host_id: int, enabled_only: bool = False):
+    sql = "SELECT * FROM oids WHERE host_id=?"
+    if enabled_only:
+        sql += " AND enabled=1"
+    return _read_all(sql + " ORDER BY oid", (host_id,))
+
+
+def enabled_oids_for_host(host_id: int):
+    """OIDs the poller should actually sample for this host."""
+    return [row["oid"] for row in host_oids(host_id, enabled_only=True)]
+
+
+def mark_host_discovered(host_id: int):
+    with _write() as conn:
+        conn.execute("UPDATE hosts SET snmp_discovered=1 WHERE id=?", (host_id,))
+        conn.commit()
+
+
+def reset_host_discovered(host_id: int):
+    """Force the next poll to run discovery again (after an OID reset)."""
+    with _write() as conn:
+        conn.execute("UPDATE hosts SET snmp_discovered=0 WHERE id=?", (host_id,))
+        conn.commit()
+
+
+# ---------------------------------------------------------------- triggers
+TRIGGER_OPS = (">", ">=", "<", "<=", "==", "!=")
+
+
+def add_trigger(host_id: int, oid: str, label: str, op: str, value: float,
+                delta: bool = False, enabled: bool = True) -> int:
+    if op not in TRIGGER_OPS:
+        raise ValueError(f"op must be one of {TRIGGER_OPS}")
+    with _write() as conn:
+        cur = conn.execute(
+            """INSERT INTO triggers(host_id, oid, label, op, value, delta, enabled,
+                                    created_at)
+               VALUES (?,?,?,?,?,?,?,?)""",
+            (host_id, oid, label, op, float(value), int(bool(delta)),
+             int(bool(enabled)), time.time()),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def update_trigger(trigger_id: int, **fields):
+    allowed = {"label", "op", "value", "delta", "enabled"}
+    cols = [c for c in fields if c in allowed]
+    if "op" in cols and fields["op"] not in TRIGGER_OPS:
+        raise ValueError(f"op must be one of {TRIGGER_OPS}")
+    if not cols:
+        return
+    assignments = []
+    params = []
+    for c in cols:
+        v = fields[c]
+        if c in ("delta", "enabled"):
+            v = int(bool(v))
+        elif c == "value":
+            v = float(v)
+        assignments.append(f"{c}=?")
+        params.append(v)
+    # Editing a rule re-arms it, otherwise a rule edited while breached stays
+    # silent until the value crosses back and forth again.
+    assignments.append("breached=0")
+    params.append(trigger_id)
+    with _write() as conn:
+        conn.execute(
+            f"UPDATE triggers SET {','.join(assignments)} WHERE id=?", params
+        )
+        conn.commit()
+
+
+def delete_trigger(trigger_id: int):
+    with _write() as conn:
+        conn.execute("DELETE FROM triggers WHERE id=?", (trigger_id,))
+        conn.commit()
+
+
+def host_triggers(host_id: int):
     return _read_all(
-        "SELECT * FROM oids WHERE host_id=? ORDER BY oid", (host_id,)
+        "SELECT * FROM triggers WHERE host_id=? ORDER BY oid, id", (host_id,)
+    )
+
+
+def all_enabled_triggers():
+    return _read_all("SELECT * FROM triggers WHERE enabled=1 ORDER BY host_id, id")
+
+
+def triggers_for_oid(host_id: int, oid: str):
+    return _read_all(
+        "SELECT * FROM triggers WHERE host_id=? AND oid=? ORDER BY id",
+        (host_id, oid),
+    )
+
+
+def set_trigger_state(trigger_id: int, breached: bool, value, fired_ts=None):
+    with _write() as conn:
+        conn.execute(
+            "UPDATE triggers SET breached=?, last_value=?, last_fired=? WHERE id=?",
+            (int(bool(breached)), value, fired_ts, trigger_id),
+        )
+        conn.commit()
+
+
+def last_value_for_oid(host_id: int, oid: str):
+    """Most recent sample for an OID, used to evaluate delta triggers."""
+    return _read_one(
+        """SELECT value, num, ts FROM samples
+           WHERE host_id=? AND oid=? ORDER BY ts DESC LIMIT 1""",
+        (host_id, oid),
+    )
+
+
+def last_values_for_oids(host_id: int, oids):
+    """Most recent sample per OID, in one query.
+
+    Delta triggers need the *previous* value, so this must be read before the
+    new samples are written — doing it afterwards compares a value with itself.
+    """
+    if not oids:
+        return {}
+    placeholders = ",".join("?" for _ in oids)
+    rows = _read_all(
+        f"""SELECT s.oid, s.value, s.num, s.ts
+            FROM samples s
+            JOIN (SELECT oid, MAX(ts) AS mts FROM samples
+                  WHERE host_id=? AND oid IN ({placeholders}) GROUP BY oid) m
+              ON s.oid = m.oid AND s.ts = m.mts
+            WHERE s.host_id=?""",
+        (host_id, *oids, host_id),
+    )
+    return {row["oid"]: row for row in rows}
+
+
+# ---------------------------------------------------------------- comparison
+def compare_oid(oid: str, since_ts: float):
+    """Cross-host comparison for a single OID.
+
+    One row per host that has samples for ``oid`` inside the window, carrying
+    the current value, min/max/avg over the window, how often the host went
+    down, and when a threshold on this OID last fired. This is the "compare my
+    printers" view: same metric, every device, side by side.
+    """
+    aggregates = _read_all(
+        """SELECT host_id,
+                  MIN(num) AS min_num, MAX(num) AS max_num, AVG(num) AS avg_num,
+                  MAX(ts) AS last_ts, COUNT(*) AS points
+           FROM samples WHERE oid=? AND ts>=? GROUP BY host_id""",
+        (oid, since_ts),
+    )
+    hosts = {row["id"]: row for row in all_hosts()}
+    rows = []
+    for agg in aggregates:
+        host = hosts.get(agg["host_id"])
+        if host is None:
+            continue
+        latest = last_value_for_oid(host["id"], oid)
+        downs = _read_one(
+            """SELECT COUNT(*) AS n FROM events
+               WHERE host_id=? AND type='down' AND ts>=?""",
+            (host["id"], since_ts),
+        )["n"]
+        alerts = _read_one(
+            """SELECT COUNT(*) AS n FROM events
+               WHERE host_id=? AND type='trigger' AND ts>=?""",
+            (host["id"], since_ts),
+        )["n"]
+        breach = _read_one(
+            """SELECT MAX(last_fired) AS ts FROM triggers
+               WHERE host_id=? AND oid=? AND last_fired IS NOT NULL AND last_fired>=?""",
+            (host["id"], oid, since_ts),
+        )["ts"]
+        rows.append({
+            "host_id": host["id"],
+            "name": host["name"],
+            "address": host["address"],
+            "enabled": bool(host["enabled"]),
+            "current": latest["value"] if latest else None,
+            "current_num": latest["num"] if latest else None,
+            "current_ts": latest["ts"] if latest else None,
+            "min": agg["min_num"],
+            "max": agg["max_num"],
+            "avg": round(agg["avg_num"], 3) if agg["avg_num"] is not None else None,
+            "points": agg["points"],
+            "downs": downs,
+            "alerts": alerts,
+            "last_breach": breach,
+        })
+    rows.sort(key=lambda r: (r["name"] or "").lower())
+    return rows
+
+
+def distinct_oids_with_labels():
+    """Every registered OID with a label, for the comparison page's picker."""
+    return _read_all(
+        """SELECT oid, label, COUNT(DISTINCT host_id) AS hosts
+           FROM oids GROUP BY oid ORDER BY hosts DESC, oid"""
     )
 
 

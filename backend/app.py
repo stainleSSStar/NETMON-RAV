@@ -441,6 +441,44 @@ def api_list_hosts(user=Depends(get_current_user)):
     return {"hosts": hosts}
 
 
+@app.get("/api/devices")
+def api_devices(user=Depends(get_current_user)):
+    """Flat device inventory for the Devices page.
+
+    Deliberately separate from /api/hosts: this is the "every device I have,
+    with its address and whether it is up" view, so it carries the monitoring
+    summary rather than the full editable configuration.
+    """
+    devices = []
+    for host in db.all_hosts():
+        status = poller.status.get(host["id"], {})
+        oids = db.host_oids(host["id"])
+        enabled_oids = [r for r in oids if r["enabled"]]
+        triggers = db.host_triggers(host["id"])
+        breached = [t for t in triggers if t["breached"] and t["enabled"]]
+        devices.append({
+            "id": host["id"],
+            "name": host["name"],
+            "address": host["address"],
+            "enabled": bool(host["enabled"]),
+            "snmp_enabled": bool(host["snmp_enabled"]),
+            "snmp_discovered": bool(host["snmp_discovered"]),
+            "check_method": host["check_method"],
+            "poll_interval": host["poll_interval"],
+            "up": status.get("up"),
+            "last_check": status.get("last_check"),
+            "last_change": status.get("last_change"),
+            "latency_ms": status.get("latency_ms"),
+            "detail": status.get("detail"),
+            "availability_24h": stats.compute_availability(host["id"], 24 * 3600),
+            "oids_total": len(oids),
+            "oids_enabled": len(enabled_oids),
+            "triggers_total": len(triggers),
+            "triggers_breached": len(breached),
+        })
+    return {"devices": devices}
+
+
 @app.post("/api/hosts")
 def api_create_host(payload: dict, admin=Depends(require_admin)):
     data = _parse_host_payload(payload)
@@ -538,6 +576,7 @@ def api_list_oids(host_id: int, user=Depends(get_current_user)):
         items.append({
             "oid": row["oid"],
             "label": row["label"],
+            "enabled": bool(row["enabled"]),
             "last_value": sample["value"] if sample else None,
             "last_num": sample["num"] if sample else None,
             "last_ts": sample["ts"] if sample else None,
@@ -546,7 +585,7 @@ def api_list_oids(host_id: int, user=Depends(get_current_user)):
         if oid not in {i["oid"] for i in items}:
             sample = latest.get(oid)
             items.append({
-                "oid": oid, "label": label, "builtin": True,
+                "oid": oid, "label": label, "builtin": True, "enabled": True,
                 "last_value": sample["value"] if sample else None,
                 "last_num": sample["num"] if sample else None,
                 "last_ts": sample["ts"] if sample else None,
@@ -565,6 +604,65 @@ def api_add_oid(host_id: int, payload: dict, admin=Depends(require_admin)):
     oid = oid.lstrip(".")
     db.add_oid(host_id, oid, label or oid)
     return {"ok": True}
+
+
+@app.patch("/api/hosts/{host_id}/oids/{oid:path}")
+def api_set_oid_enabled(host_id: int, oid: str, payload: dict,
+                        admin=Depends(require_admin)):
+    """Enable or disable polling for one OID.
+
+    Disabling stops sampling but keeps the OID's config and its whole history,
+    so it can be switched back on later without losing anything.
+    """
+    if not db.get_host(host_id):
+        raise HTTPException(404, "Host not found")
+    if "enabled" not in payload:
+        raise HTTPException(422, "Body must contain 'enabled' (true or false)")
+    oid = oid.lstrip(".")
+    if not db.set_oid_enabled(host_id, oid, bool(payload["enabled"])):
+        raise HTTPException(404, "OID not found for this host")
+    return {"ok": True, "oid": oid, "enabled": bool(payload["enabled"])}
+
+
+@app.post("/api/hosts/{host_id}/discover")
+async def api_discover_host(host_id: int, admin=Depends(require_admin)):
+    """Re-run the OID walk for a host, registering anything new.
+
+    Discovery is idempotent: existing OIDs keep the enabled flag the user chose,
+    so this is safe to run repeatedly and only ever adds.
+    """
+    host = db.get_host(host_id)
+    if not host:
+        raise HTTPException(404, "Host not found")
+    if not host["snmp_enabled"]:
+        raise HTTPException(422, "SNMP is disabled for this host")
+    try:
+        host = _decrypt_host_secrets(host)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc))
+    result = await snmplib.discover_oids(host)
+    if not result.get("ok"):
+        raise HTTPException(502, f"Discovery failed: {result.get('error', 'unknown')}")
+    rows = [
+        (oid, label, int(snmplib.is_essential_oid(oid)))
+        for oid, label in result["oids"]
+    ]
+    db.add_oids_bulk(host_id, rows)
+    db.mark_host_discovered(host_id)
+    enabled = sum(1 for _, _, e in rows if e)
+    db.add_event(
+        host_id, "discovery",
+        f"Discovered {len(rows)} OIDs; {enabled} enabled for polling"
+        + (" (walk hit the discovery cap)" if result.get("capped") else ""),
+        actor=admin["username"],
+    )
+    await_reload(host_id)
+    return {
+        "ok": True,
+        "discovered": len(rows),
+        "enabled": enabled,
+        "capped": bool(result.get("capped")),
+    }
 
 
 @app.delete("/api/hosts/{host_id}/oids/{oid:path}")
@@ -633,6 +731,101 @@ def api_events(host_id: int = None, limit: int = 100,
                user=Depends(get_current_user)):
     limit = max(1, min(int(limit), 500))
     return {"events": [dict(row) for row in db.events(host_id, limit)]}
+
+
+# ---------------------------------------------------------------- triggers
+@app.get("/api/hosts/{host_id}/triggers")
+def api_list_triggers(host_id: int, user=Depends(get_current_user)):
+    if not db.get_host(host_id):
+        raise HTTPException(404, "Host not found")
+    return {"triggers": [dict(row) for row in db.host_triggers(host_id)]}
+
+
+@app.post("/api/hosts/{host_id}/triggers")
+def api_add_trigger(host_id: int, payload: dict, admin=Depends(require_admin)):
+    if not db.get_host(host_id):
+        raise HTTPException(404, "Host not found")
+    oid = str(payload.get("oid") or "").strip().lstrip(".")
+    if not _OID_RE.match(oid):
+        raise HTTPException(422, "Invalid OID (expected e.g. 1.3.6.1.2.1.1.3.0)")
+    op = str(payload.get("op") or ">=")
+    if op not in db.TRIGGER_OPS:
+        raise HTTPException(422, f"op must be one of {', '.join(db.TRIGGER_OPS)}")
+    try:
+        value = float(payload.get("value"))
+    except (TypeError, ValueError):
+        raise HTTPException(422, "value must be a number")
+    trigger_id = db.add_trigger(
+        host_id,
+        oid,
+        str(payload.get("label") or "").strip()[:128] or oid,
+        op,
+        value,
+        delta=bool(payload.get("delta")),
+        enabled=bool(payload.get("enabled", True)),
+    )
+    db.add_event(
+        host_id, "trigger_added",
+        f"Trigger '{oid} {op} {value}' added", actor=admin["username"],
+    )
+    return {"ok": True, "id": trigger_id}
+
+
+@app.patch("/api/hosts/{host_id}/triggers/{trigger_id}")
+def api_update_trigger(host_id: int, trigger_id: int, payload: dict,
+                       admin=Depends(require_admin)):
+    if not db.get_host(host_id):
+        raise HTTPException(404, "Host not found")
+    if not any(t["id"] == trigger_id for t in db.host_triggers(host_id)):
+        raise HTTPException(404, "Trigger not found for this host")
+    if "op" in payload and payload["op"] not in db.TRIGGER_OPS:
+        raise HTTPException(422, f"op must be one of {', '.join(db.TRIGGER_OPS)}")
+    if "value" in payload:
+        try:
+            payload["value"] = float(payload["value"])
+        except (TypeError, ValueError):
+            raise HTTPException(422, "value must be a number")
+    try:
+        db.update_trigger(trigger_id, **{
+            k: v for k, v in payload.items()
+            if k in ("label", "op", "value", "delta", "enabled")
+        })
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+    return {"ok": True}
+
+
+@app.delete("/api/hosts/{host_id}/triggers/{trigger_id}")
+def api_delete_trigger(host_id: int, trigger_id: int,
+                       admin=Depends(require_admin)):
+    if not db.get_host(host_id):
+        raise HTTPException(404, "Host not found")
+    if not any(t["id"] == trigger_id for t in db.host_triggers(host_id)):
+        raise HTTPException(404, "Trigger not found for this host")
+    db.delete_trigger(trigger_id)
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- compare
+@app.get("/api/compare")
+def api_compare(oid: str, hours: float = 24, user=Depends(get_current_user)):
+    """Cross-host comparison table for one OID."""
+    oid = (oid or "").strip().lstrip(".")
+    if not _OID_RE.match(oid):
+        raise HTTPException(422, "Invalid OID")
+    if hours <= 0 or hours > 24 * 90:
+        raise HTTPException(422, "hours must be between 0 and 2160")
+    return {
+        "oid": oid,
+        "hours": hours,
+        "rows": db.compare_oid(oid, time.time() - hours * 3600),
+    }
+
+
+@app.get("/api/compare/oids")
+def api_compare_oids(user=Depends(get_current_user)):
+    """OIDs available for comparison, most widely monitored first."""
+    return {"oids": [dict(row) for row in db.distinct_oids_with_labels()]}
 
 
 # ------------------------------------------------------------------ ssh creds

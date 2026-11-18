@@ -67,4 +67,9 @@ EVENT_RETENTION_DAYS = _env_int(
 SESSION_TTL_HOURS = _env_int("NETMON_SESSION_TTL", 168, minimum=1, maximum=8760)
 COOKIE_SECURE = os.environ.get("NETMON_COOKIE_SECURE", "0") == "1"
 PING_TIMEOUT = _env_float("NETMON_PING_TIMEOUT", 2.0, minimum=0.1)
+# Safety cap on first-run OID discovery. A large switch or printer can expose
+# thousands of OIDs; registering every one of them would make each poll slow
+# and the samples table huge. Everything found is stored, but polling only
+# touches the OIDs the user leaves enabled.
+DISCOVERY_MAX_OIDS = _env_int("NETMON_DISCOVERY_MAX", 2000, minimum=10, maximum=100000)
 APP_NAME = "NetMon"

@@ -61,6 +61,8 @@ SYS_UPTIME_OID = "1.3.6.1.2.1.1.3.0"
 
 import pysnmp.hlapi as _hlapi
 
+from .config import DISCOVERY_MAX_OIDS
+
 AUTH_PROTOS = {
     "MD5": usmHMACMD5AuthProtocol,
     "SHA": usmHMACSHAAuthProtocol,
@@ -300,3 +302,51 @@ async def snmp_walk(host: dict, base_oid: str, max_rows: int = 200, timeout: flo
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     finally:
         _close_engine(engine)
+
+
+# OIDs worth polling on essentially every device. Discovery registers
+# *everything* a device exposes, but only these start enabled — otherwise a
+# switch's full interface table plus every vendor counter would be sampled on
+# every poll, which is slow and fills the samples table with noise.
+ESSENTIAL_EXACT = frozenset({
+    "1.3.6.1.2.1.1.1.0",  # sysDescr
+    "1.3.6.1.2.1.1.3.0",  # sysUpTime
+    "1.3.6.1.2.1.1.4.0",  # sysContact
+    "1.3.6.1.2.1.1.5.0",  # sysName
+    "1.3.6.1.2.1.1.6.0",  # sysLocation
+    "1.3.6.1.2.1.2.1.0",  # ifNumber
+})
+ESSENTIAL_PREFIXES = (
+    "1.3.6.1.2.1.2.2.1.1.",   # ifIndex
+    "1.3.6.1.2.1.2.2.1.2.",   # ifDescr
+    "1.3.6.1.2.1.2.2.1.8.",   # ifOperStatus
+)
+
+
+def is_essential_oid(oid: str) -> bool:
+    """Whether a discovered OID should be enabled for polling by default."""
+    return oid in ESSENTIAL_EXACT or oid.startswith(ESSENTIAL_PREFIXES)
+
+
+async def discover_oids(host: dict, max_rows: int = None):
+    """Walk a device and report everything it exposes.
+
+    Returns {"ok": True, "oids": [(oid, label)], "total": n, "capped": bool} —
+    or {"ok": False, "error": ...}. The walk starts at the MIB root, so a real
+    device returns its whole tree; ``max_rows`` (DISCOVERY_MAX_OIDS) is the
+    safety cap that keeps a pathological agent from registering millions of
+    rows.
+    """
+    if max_rows is None:
+        max_rows = DISCOVERY_MAX_OIDS
+    result = await snmp_walk(host, "1.3.6.1", max_rows=max_rows, timeout=5.0)
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error", "walk failed")}
+    rows = result.get("rows") or []
+    oids = [(row["oid"], row["oid"]) for row in rows]
+    return {
+        "ok": True,
+        "oids": oids,
+        "total": len(oids),
+        "capped": len(rows) >= max_rows,
+    }

@@ -222,3 +222,19 @@ table.data tr:hover td { background: var(--bg-card-hover); }
   color: #e8c36a; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 14px;
 }
 .notice.blue { border-color: rgba(61,139,253,.4); background: rgba(61,139,253,.07); color: #9cc4ff; }
+.notice.red { border-color: rgba(248,81,73,.4); background: rgba(248,81,73,.08); color: #ffa198; }
+
+/* OID whose collection is switched off: dimmed but still readable, because
+   its history and configuration are kept. */
+tr.oid-off { opacity: .55; }
+tr.oid-off .mono { color: var(--text-dim); }
+
+/* A trigger currently in the breached state. */
+tr.trig-breached { background: rgba(248,81,73,.07); }
+.badge.breach { color: #ffa198; border-color: rgba(248,81,73,.55); background: rgba(248,81,73,.12); }
+
+/* Inline checkbox rows used by the trigger form. */
+.check { display: flex; gap: 9px; align-items: flex-start; font-size: 13px; color: var(--text); margin-top: 10px; cursor: pointer; }
+.check input { margin-top: 2px; flex: none; }
+.field-row { display: flex; gap: 10px; }
+.field-row .field { flex: 1; }

@@ -559,6 +559,197 @@ def run_tests():
     r = s.get(BASE + f"/api/hosts/{host5['id']}/oids", timeout=5)
     check("deleted host data gone", r.status_code == 404, f"got {r.status_code}")
 
+    print("\n== discovery, oid toggles, triggers, devices, compare ==", flush=True)
+
+    # ---- first-run discovery -------------------------------------------
+    # host1 polls the mini agent over v2c, so its first poll must have walked
+    # the device and registered everything it exposes.
+    deadline = time.time() + 25
+    while time.time() < deadline:
+        d = s.get(BASE + "/api/devices", timeout=5).json()["devices"]
+        h1_dev = next((x for x in d if x["id"] == host1["id"]), None)
+        if h1_dev and h1_dev["snmp_discovered"]:
+            break
+        time.sleep(1)
+    check("host auto-discovered on first poll",
+          bool(h1_dev and h1_dev["snmp_discovered"]), json.dumps(h1_dev))
+
+    disc_oids = s.get(BASE + f"/api/hosts/{host1['id']}/oids", timeout=5).json()["oids"]
+    non_builtin = [o for o in disc_oids if not o.get("builtin")]
+    enabled_nb = [o for o in non_builtin if o["enabled"]]
+    check("discovery registered the agent's OIDs", len(non_builtin) >= 20,
+          f"{len(non_builtin)} non-builtin oids")
+    check("discovery enabled only essentials", 0 < len(enabled_nb) < len(non_builtin),
+          f"{len(enabled_nb)}/{len(non_builtin)} enabled")
+    check("sysName is an essential (enabled)",
+          any(o["oid"] == "1.3.6.1.2.1.1.5.0" and o["enabled"] for o in non_builtin))
+    # An OID the user explicitly added earlier in this suite stays enabled even
+    # though discovery classifies it as non-essential: an explicit add is a
+    # statement of intent, discovery must not undo it.
+    check("explicitly added OID stays enabled",
+          any(o["oid"] == "1.3.6.1.2.1.2.2.1.10.1" and o["enabled"] for o in non_builtin),
+          json.dumps([o for o in non_builtin if o["oid"].endswith(".10.1")]))
+    untouched = "1.3.6.1.2.1.31.1.1.1.6.1"  # ifHCInOctets.1 — never touched by this suite
+    check("an untouched non-essential OID starts disabled",
+          any(o["oid"] == untouched and not o["enabled"] for o in non_builtin),
+          json.dumps([o for o in non_builtin if o["oid"] == untouched]))
+    evs = s.get(BASE + f"/api/hosts/{host1['id']}/events?limit=100", timeout=5).json()["events"]
+    check("discovery writes an event", any(e["type"] == "discovery" for e in evs),
+          str([e["type"] for e in evs]))
+
+    # ---- enable / disable an OID ---------------------------------------
+    target = "1.3.6.1.2.1.31.1.1.1.6.1"  # ifHCInOctets.1 — discovered, not essential
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/oids/{target}",
+                json={"enabled": True}, timeout=5)
+    check("enable an OID", r.status_code == 200 and r.json()["enabled"] is True, r.text)
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/oids/{target}",
+                json={"enabled": False}, timeout=5)
+    check("disable an OID", r.status_code == 200 and r.json()["enabled"] is False, r.text)
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/oids/{target}", json={}, timeout=5)
+    check("PATCH without 'enabled' rejected", r.status_code == 422, f"got {r.status_code}")
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/oids/9.9.9.9",
+                json={"enabled": True}, timeout=5)
+    check("PATCH unknown OID rejected", r.status_code == 404, f"got {r.status_code}")
+
+    # A disabled OID must stop being sampled, and its history must survive.
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/oids/{target}",
+                json={"enabled": True}, timeout=5)
+    deadline = time.time() + 25
+    sampled = None
+    while time.time() < deadline:
+        series = s.get(BASE + f"/api/hosts/{host1['id']}/series"
+                        f"?oid={target}&hours=1", timeout=5).json()
+        if series["points"]:
+            sampled = series
+            break
+        time.sleep(1)
+    check("re-enabled OID starts being sampled", bool(sampled and sampled["points"]),
+          json.dumps(sampled)[:120] if sampled else "no points")
+
+    # ---- triggers -------------------------------------------------------
+    r = s.get(BASE + f"/api/hosts/{host1['id']}/triggers", timeout=5)
+    check("no triggers exist by default", r.status_code == 200 and r.json()["triggers"] == [],
+          r.text)
+
+    r = s.post(BASE + f"/api/hosts/{host1['id']}/triggers", json={
+        "oid": "1.3.6.1.2.1.1.3.0", "label": "uptime high",
+        "op": ">=", "value": 1,
+    }, timeout=5)
+    check("add absolute trigger", r.status_code == 200, r.text)
+    trig_id = r.json()["id"]
+
+    r = s.post(BASE + f"/api/hosts/{host1['id']}/triggers", json={
+        "oid": "1.3.6.1.2.1.1.3.0", "label": "bad op", "op": "~=", "value": 1,
+    }, timeout=5)
+    check("invalid trigger op rejected", r.status_code == 422, f"got {r.status_code}")
+    r = s.post(BASE + f"/api/hosts/{host1['id']}/triggers", json={
+        "oid": "1.3.6.1.2.1.1.3.0", "label": "bad value", "op": ">=", "value": "abc",
+    }, timeout=5)
+    check("non-numeric trigger value rejected", r.status_code == 422, f"got {r.status_code}")
+
+    r = s.post(BASE + f"/api/hosts/{host1['id']}/triggers", json={
+        "oid": "1.3.6.1.2.1.2.2.1.10.1", "label": "traffic jump",
+        "op": ">", "value": 1, "delta": True,
+    }, timeout=5)
+    check("add delta trigger", r.status_code == 200, r.text)
+    delta_id = r.json()["id"]
+
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/triggers/{trig_id}",
+                json={"value": 1}, timeout=5)
+    check("update trigger", r.status_code == 200, r.text)
+
+    # sysUpTime is always above 1, so this must fire.
+    deadline = time.time() + 25
+    breached = False
+    while time.time() < deadline:
+        trigs = {t["id"]: t for t in
+                 s.get(BASE + f"/api/hosts/{host1['id']}/triggers", timeout=5).json()["triggers"]}
+        if trigs.get(trig_id, {}).get("breached"):
+            breached = True
+            break
+        time.sleep(1)
+    check("absolute trigger fires", breached)
+
+    # While breached, further polls must not write more trigger events.
+    events_before = len([e for e in
+                         s.get(BASE + f"/api/hosts/{host1['id']}/events?limit=200", timeout=5).json()["events"]
+                         if e["type"] == "trigger"])
+    time.sleep(12)
+    events_after = len([e for e in
+                        s.get(BASE + f"/api/hosts/{host1['id']}/events?limit=200", timeout=5).json()["events"]
+                        if e["type"] == "trigger"])
+    check("no repeat trigger event while still breached",
+          events_after == events_before, f"{events_before} -> {events_after}")
+
+    # Editing the rule re-arms it, so it must fire again.
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/triggers/{trig_id}",
+                json={"value": 999999999}, timeout=5)
+    deadline = time.time() + 25
+    cleared = False
+    while time.time() < deadline:
+        trigs = {t["id"]: t for t in
+                 s.get(BASE + f"/api/hosts/{host1['id']}/triggers", timeout=5).json()["triggers"]}
+        if not trigs.get(trig_id, {}).get("breached"):
+            cleared = True
+            break
+        time.sleep(1)
+    check("raising the threshold clears the breach", cleared)
+
+    # Re-arm and fire once more so the device-level breach count below has
+    # something to count.
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/triggers/{trig_id}",
+                json={"value": 1}, timeout=5)
+    deadline = time.time() + 25
+    refired = False
+    while time.time() < deadline:
+        trigs = {t["id"]: t for t in
+                 s.get(BASE + f"/api/hosts/{host1['id']}/triggers", timeout=5).json()["triggers"]}
+        if trigs.get(trig_id, {}).get("breached"):
+            refired = True
+            break
+        time.sleep(1)
+    check("lowering the threshold fires again", refired)
+
+    r = s.patch(BASE + f"/api/hosts/{host1['id']}/triggers/{delta_id}",
+                json={"enabled": False}, timeout=5)
+    check("disable a trigger", r.status_code == 200, r.text)
+    r = s.delete(BASE + f"/api/hosts/{host1['id']}/triggers/{delta_id}", timeout=5)
+    check("delete a trigger", r.status_code == 200, r.text)
+    r = s.delete(BASE + f"/api/hosts/{host1['id']}/triggers/{delta_id}", timeout=5)
+    check("deleting a missing trigger 404s", r.status_code == 404, f"got {r.status_code}")
+
+    # ---- devices endpoint ----------------------------------------------
+    devices = s.get(BASE + "/api/devices", timeout=5).json()["devices"]
+    by_id = {d["id"]: d for d in devices}
+    check("devices lists every host", len(devices) >= 5, f"{len(devices)} devices")
+    check("device carries address", by_id[host1["id"]]["address"] == "127.0.0.1")
+    check("device carries status",
+          by_id[host1["id"]]["up"] is True and by_id[host2["id"]]["up"] is False,
+          json.dumps({k: v.get("up") for k, v in by_id.items()}))
+    check("device carries availability",
+          by_id[host1["id"]]["availability_24h"]["availability_pct"] is not None)
+    check("device carries oid counts",
+          by_id[host1["id"]]["oids_total"] > 0 and
+          by_id[host1["id"]]["oids_enabled"] <= by_id[host1["id"]]["oids_total"])
+    check("device counts breached triggers", by_id[host1["id"]]["triggers_breached"] >= 1)
+
+    # ---- comparison ----------------------------------------------------
+    r = s.get(BASE + "/api/compare/oids", timeout=5)
+    check("compare oid picker populated", r.status_code == 200 and r.json()["oids"],
+          r.text[:120])
+    cmp_oid = r.json()["oids"][0]["oid"]
+    r = s.get(BASE + f"/api/compare?oid={cmp_oid}&hours=24", timeout=5)
+    check("compare returns rows", r.status_code == 200 and isinstance(r.json()["rows"], list),
+          r.text[:120])
+    rows = r.json()["rows"]
+    check("compare rows carry stats",
+          all({"current", "min", "max", "avg", "downs", "alerts"} <= set(row) for row in rows),
+          json.dumps(rows[:1]))
+    check("compare rows carry host identity",
+          all(row["name"] and row["address"] for row in rows))
+    r = s.get(BASE + "/api/compare?oid=not-an-oid", timeout=5)
+    check("compare rejects a bad oid", r.status_code == 422, f"got {r.status_code}")
+
     print("\n== static frontend ==", flush=True)
     r = requests.get(BASE + "/", timeout=5)
     check("index.html served", r.status_code == 200 and "NetMon" in r.text)

@@ -17,6 +17,32 @@ from .config import EVENT_RETENTION_DAYS, PING_TIMEOUT, SAMPLE_RETENTION_DAYS
 _ping_bin_missing_logged = set()
 
 
+def _compare(value: float, op: str, threshold: float) -> bool:
+    """Apply a trigger operator. Unknown operators never fire."""
+    if op == ">":
+        return value > threshold
+    if op == ">=":
+        return value >= threshold
+    if op == "<":
+        return value < threshold
+    if op == "<=":
+        return value <= threshold
+    if op == "==":
+        return value == threshold
+    if op == "!=":
+        return value != threshold
+    return False
+
+
+def _fmt_num(value) -> str:
+    """Compact number for event messages (no float noise like 50000.0000001)."""
+    if value is None:
+        return "—"
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value)
+
+
 async def ping(address: str, timeout: float = None):
     """ICMP echo check. Returns (ok, detail); ok is None when ping is unusable."""
     if timeout is None:
@@ -72,6 +98,7 @@ class Poller:
         self._maint = None
         self._stopped = False
         self.loop = None
+        self._discovering = set()
 
     # ------------------------------------------------------------- lifecycle
     async def start(self):
@@ -150,6 +177,7 @@ class Poller:
         for key in [k for k in self._last_snmp_err if k[0] == host_id]:
             self._last_snmp_err.pop(key, None)
         _ping_bin_missing_logged.discard(host_id)
+        self._discovering.discard(host_id)
 
     async def reload(self, host_id: int = None):
         """Re-read host configuration after CRUD changes."""
@@ -265,10 +293,14 @@ class Poller:
             state["up"] = ok
 
         if host["snmp_enabled"]:
+            if not host.get("snmp_discovered"):
+                # First successful poll on an SNMP host: learn what it exposes.
+                # Runs as its own task so a large walk cannot stall this loop.
+                asyncio.create_task(self._discover(host))
             await self._sample(host)
 
     async def _sample(self, host):
-        oids = [row["oid"] for row in db.host_oids(host["id"])]
+        oids = db.enabled_oids_for_host(host["id"])
         oids += [oid for oid, _ in db.DEFAULT_OIDS if oid not in oids]
         if not oids:
             return
@@ -289,7 +321,97 @@ class Poller:
             (host["id"], oid, ts, text, num)
             for oid, (text, num) in result["values"].items()
         ]
+        # Snapshot the previous values *before* the new rows land: read after
+        # the write, every delta trigger would compare a value with itself.
+        previous = await asyncio.to_thread(
+            db.last_values_for_oids, host["id"], list(result["values"])
+        )
         await asyncio.to_thread(db.add_samples, rows)
+        await self._evaluate_triggers(host, result["values"], ts, previous)
+
+    async def _evaluate_triggers(self, host, values, ts, previous):
+        """Fire user-defined thresholds against the values just sampled.
+
+        Only OIDs that were actually sampled this round are considered, so a
+        disabled OID cannot fire its rule. Each trigger is edge-triggered: it
+        fires on the transition into the breached state and re-arms when the
+        value leaves it, which is what stops a printer sitting above its page
+        limit from writing an event every single poll.
+        """
+        triggers = await asyncio.to_thread(db.host_triggers, host["id"])
+        for trig in triggers:
+            if not trig["enabled"] or trig["oid"] not in values:
+                continue
+            text, num = values[trig["oid"]]
+            if num is None:
+                # Non-numeric value (a string OID): no comparison is possible.
+                continue
+            reference = num
+            if trig["delta"]:
+                prior = previous.get(trig["oid"])
+                if not prior or prior["num"] is None:
+                    # First sample for this OID: nothing to compare against.
+                    continue
+                reference = num - prior["num"]
+            if not _compare(reference, trig["op"], trig["value"]):
+                if trig["breached"]:
+                    await asyncio.to_thread(
+                        db.set_trigger_state, trig["id"], False, num
+                    )
+                continue
+            if trig["breached"]:
+                continue
+            await asyncio.to_thread(
+                db.set_trigger_state, trig["id"], True, num, fired_ts=ts
+            )
+            await asyncio.to_thread(
+                db.add_event,
+                host["id"],
+                "trigger",
+                f"{trig['label'] or trig['oid']} breached: "
+                f"{_fmt_num(reference)} {trig['op']} {_fmt_num(trig['value'])}"
+                + (f" (was {_fmt_num(num)})" if trig["delta"] else ""),
+            )
+
+    async def _discover(self, host):
+        """One-time full walk that registers every OID the device exposes.
+
+        Runs as its own task so a slow or very large agent cannot stall the
+        host's reachability loop. Everything found is stored; only the
+        essentials start enabled, and the user turns on the rest.
+        """
+        host_id = host["id"]
+        if host_id in self._discovering:
+            return
+        self._discovering.add(host_id)
+        try:
+            result = await snmplib.discover_oids(host)
+            if not result.get("ok"):
+                # Discovery failed (timeout, bad community): leave the host
+                # undiscovered so the next poll tries again.
+                return
+            rows = [
+                (oid, label, int(snmplib.is_essential_oid(oid)))
+                for oid, label in result["oids"]
+            ]
+            await asyncio.to_thread(db.add_oids_bulk, host_id, rows)
+            await asyncio.to_thread(db.mark_host_discovered, host_id)
+            enabled = sum(1 for _, _, e in rows if e)
+            await asyncio.to_thread(
+                db.add_event,
+                host_id,
+                "discovery",
+                f"Discovered {len(rows)} OIDs; {enabled} enabled for polling"
+                + (" (walk hit the discovery cap)" if result.get("capped") else ""),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # never let discovery kill the poller
+            await asyncio.to_thread(
+                db.add_event, host_id, "poll_error", f"OID discovery failed: {exc}"
+            )
+        finally:
+            self._discovering.discard(host_id)
 
     async def _log_once(self, host_id: int, type_: str, message: str, interval: float = 300):
         """Rate-limit repetitive error events (one per interval per host)."""
