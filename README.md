@@ -6,13 +6,21 @@ SSH console in the browser, and an event log that records every state change
 and every SSH session. Everything runs in one container with a single volume
 for state.
 
-## Quick start
+## Install
+
+Docker is the supported way to run it — one container, one state directory.
 
 ```bash
+git clone https://github.com/stainleSSStar/NETMON-RAV.git
+cd NETMON-RAV
 docker compose up -d --build
 ```
 
-Then open <http://localhost:8080>.
+Then open <http://localhost:8080> and create the administrator account.
+
+**First run:** the app asks you to create the administrator account — there are
+no default credentials anywhere. Choose a username (3–32 chars: letters,
+digits, `_`, `.`, `-`) and a password of at least 10 characters.
 
 > **Never commit `data/`.** It holds `netmon.db` and `secret.key` — the Fernet key
 > that decrypts every stored SNMP community, v3 key and saved SSH password.
@@ -91,7 +99,10 @@ Environment variables (optional):
 | `NETMON_EVENT_RETENTION_DAYS` | `365` | How long the event history is kept     |
 | `NETMON_SESSION_TTL`     | `168`   | Session lifetime in hours                 |
 | `NETMON_COOKIE_SECURE`   | `0`     | Set `1` when serving over HTTPS           |
+| `NETMON_PING_TIMEOUT`    | `2.0`   | ICMP probe timeout in seconds             |
 | `NETMON_UID` / `NETMON_GID` | `10001` | Container user for the `./data` volume |
+
+Any of these can also be set in a `.env` file next to `docker-compose.yml`.
 
 `data/secret.key` encrypts SNMP communities, v3 keys and saved SSH passwords.
 **Back it up together with `data/`** — without it those secrets cannot be
@@ -109,7 +120,7 @@ the WebSocket SSH terminal (including saved credentials), rate limiting,
 password change and account lifecycle.
 
 ```bash
-cd netmon
+cd NETMON-RAV
 .venv/bin/python tests/e2e_test.py        # or: python3 tests/e2e_test.py
 ```
 
@@ -134,7 +145,7 @@ is reported down).
 ## Running without Docker (development)
 
 ```bash
-cd netmon
+cd NETMON-RAV
 pip install -r backend/requirements.txt
 NETMON_DATA_DIR=./data NETMON_FRONTEND_DIR=./frontend \
   uvicorn backend.app:app --reload --port 8080
@@ -156,6 +167,17 @@ ICMP ping needs privileges when running outside the container (run with
    chose.
 5. **SSH →** opens the console: username + password, optional "save
    credentials", then a normal shell.
+
+## Updating
+
+```bash
+cd NETMON-RAV
+git pull
+docker compose up -d --build
+```
+
+State in `data/` (accounts, hosts, history) survives updates — you stay logged in
+and nothing is re-entered.
 
 ## Stopping
 

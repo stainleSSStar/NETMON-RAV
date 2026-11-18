@@ -18,6 +18,8 @@ services:
     environment:
       - NETMON_POLL_INTERVAL=${NETMON_POLL_INTERVAL:-60}
       - NETMON_RETENTION_DAYS=${NETMON_RETENTION_DAYS:-30}
+      - NETMON_EVENT_RETENTION_DAYS=${NETMON_EVENT_RETENTION_DAYS:-365}
+      - NETMON_SESSION_TTL=${NETMON_SESSION_TTL:-168}
       # Set to 1 when NetMon is reached over HTTPS (reverse proxy) so the
       # session cookie gets the Secure flag.
       - NETMON_COOKIE_SECURE=${NETMON_COOKIE_SECURE:-0}
