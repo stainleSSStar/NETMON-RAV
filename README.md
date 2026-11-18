@@ -123,6 +123,7 @@ Environment variables (optional):
 | `NETMON_COOKIE_SECURE`   | `0`     | Set `1` when serving over HTTPS           |
 | `NETMON_PING_TIMEOUT`    | `2.0`   | ICMP probe timeout in seconds             |
 | `NETMON_DISCOVERY_MAX`   | `2000`  | Safety cap on OIDs registered per host by first-run discovery |
+| `NETMON_DISCOVERY_TIMEOUT` | `120` | Wall-clock cap (s) on one discovery walk, so an agent that answers nothing cannot hold the task open indefinitely |
 | `NETMON_UID` / `NETMON_GID` | `10001` | Container user for the `./data` volume |
 
 Any of these can also be set in a `.env` file next to `docker-compose.yml`.

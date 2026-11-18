@@ -8,6 +8,7 @@ limiting, password change and secret hygiene.
 
     python3 tests/e2e_test.py
 """
+import asyncio
 import json
 import os
 import shutil
@@ -369,6 +370,66 @@ def run_tests():
     check("v1 walk (GETNEXT) returns system rows",
           walk_v1.get("ok") and len(walk_v1.get("rows", [])) >= 3, json.dumps(walk_v1)[:200])
 
+    # ---- regression: one bad OID must not lose the whole batch -------------
+    # An agent answers an unknown instance with noSuchObject. The old code
+    # treated that as a failed GET and dropped every varbind, so a removed
+    # interface cost the host all of its samples with no visible cause.
+    if ROOT not in sys.path:
+        sys.path.insert(0, ROOT)
+    from backend import snmp as snmp_mod
+
+    async def _probe_partial():
+        return await snmp_mod.snmp_get_multi(
+            {"address": "127.0.0.1", "snmp_port": SNMP_PORT, "snmp_version": "2c",
+             "community": "public"},
+            ["1.3.6.1.2.1.1.5.0", "1.3.6.1.2.1.99.99.0"],
+        )
+
+    mixed = asyncio.run(_probe_partial())
+    check("partial GET keeps the resolvable OID",
+          mixed.get("ok") and "1.3.6.1.2.1.1.5.0" in mixed.get("values", {}),
+          json.dumps(mixed)[:200])
+    check("partial GET reports the unresolvable OID",
+          mixed.get("partial") and "1.3.6.1.2.1.99.99.0" in mixed.get("failed", []),
+          json.dumps(mixed)[:200])
+
+    async def _probe_ipv6():
+        return await snmp_mod.snmp_get_multi(
+            {"address": "::1", "snmp_port": SNMP_PORT, "snmp_version": "2c",
+             "community": "public"},
+            ["1.3.6.1.2.1.1.5.0"],
+        )
+
+    v6 = asyncio.run(_probe_ipv6())
+    check("IPv6 literal fails with an actionable message",
+          v6.get("ok") is False and "IPv4" in v6.get("error", ""),
+          json.dumps(v6)[:200])
+
+    async def _probe_v3():
+        return await snmp_mod.snmp_get_multi(
+            {"address": "127.0.0.1", "snmp_port": SNMP_PORT, "snmp_version": "3",
+             "v3_user": "u", "v3_auth_key": "k" * 48, "v3_auth_proto": "NOPE"},
+            ["1.3.6.1.2.1.1.5.0"],
+        )
+
+    v3 = asyncio.run(_probe_v3())
+    check("unknown v3 auth protocol is refused, not downgraded",
+          v3.get("ok") is False and "auth protocol" in v3.get("error", ""),
+          json.dumps(v3)[:200])
+
+    async def _probe_deadline():
+        return await snmp_mod.snmp_walk(
+            {"address": "127.0.0.1", "snmp_port": SNMP_PORT, "snmp_version": "2c",
+             "community": "public"},
+            "1.3.6.1.2.1", max_rows=200, timeout=2.0, max_seconds=0.0001,
+        )
+
+    truncated = asyncio.run(_probe_deadline())
+    check("walk stops on its wall-clock deadline and says so",
+          truncated.get("ok") and truncated.get("truncated") is True
+          and 0 < len(truncated.get("rows", [])) < 200,
+          json.dumps(truncated)[:200])
+
     test = s.post(BASE + f"/api/hosts/{host1['id']}/test", timeout=20).json()
     check("test endpoint: ping ok", test["ping"]["ok"] is True, json.dumps(test["ping"]),
           skip=not ICMP_OK)
@@ -403,7 +464,8 @@ def run_tests():
     check("read-only cannot save ssh creds", r.status_code == 403, f"got {r.status_code}")
 
     print("\n== ssh terminal ==", flush=True)
-    import asyncio
+    # asyncio is imported at module scope; a local ``import asyncio`` here would
+    # shadow it for the whole run_tests() body.
     import websockets
 
     async def ws_probe(cookie, payload, expect, timeout=20):

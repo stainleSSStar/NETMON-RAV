@@ -23,4 +23,9 @@ services:
       # Set to 1 when NetMon is reached over HTTPS (reverse proxy) so the
       # session cookie gets the Secure flag.
       - NETMON_COOKIE_SECURE=${NETMON_COOKIE_SECURE:-0}
+      # Discovery walk caps: rows registered per host, and wall-clock seconds
+      # for one walk (an agent that answers nothing would otherwise keep the
+      # task alive for minutes).
+      - NETMON_DISCOVERY_MAX=${NETMON_DISCOVERY_MAX:-2000}
+      - NETMON_DISCOVERY_TIMEOUT=${NETMON_DISCOVERY_TIMEOUT:-120}
     restart: unless-stopped

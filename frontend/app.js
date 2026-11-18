@@ -65,6 +65,11 @@ function fmtDur(seconds) {
   return `${s}s`;
 }
 
+const RANGE_LABELS = { 24: '24h', 168: '7d', 720: '30d' };
+function rangeLabel(hours) {
+  return RANGE_LABELS[hours] || `${hours}h`;
+}
+
 async function api(path, options = {}) {
   const opts = {
     method: options.method || 'GET',
@@ -393,6 +398,9 @@ async function viewDashboard() {
   const up = hosts.filter((h) => h.status.up === true).length;
   const down = hosts.filter((h) => h.status.up === false).length;
   const unknown = hosts.length - up - down;
+  // api() nulls state.user and redirects on a 401, so read the role after the
+  // awaits can throw. Bail out instead of crashing on state.user.role.
+  if (!state.user) return;
   const isAdmin = state.user.role === 'admin';
 
   shell(`
@@ -435,9 +443,14 @@ async function viewDashboard() {
     if (parseRoute().name !== 'dashboard') return;
     try {
       const data = await api('/api/hosts');
+      // Re-check the route *after* the await. Navigating to a host page or the
+      // SSH console while this fetch was in flight used to fall through to
+      // route() below, which runs cleanupViews() -> closeTerminal() and kills
+      // a terminal the user had just connected.
+      if (parseRoute().name !== 'dashboard') return;
       for (const h of data.hosts) {
         const card = $app.querySelector(`[data-host="${h.id}"]`);
-        if (!card) return route();
+        if (!card) { route(); return; }
         card.querySelector('.dot')?.replaceWith(makeDot(h.status, h.enabled));
       }
     } catch (e) { /* session expired etc. */ }
@@ -660,8 +673,8 @@ async function viewHost(id) {
         <div class="stat"><div class="label">Status</div>
           <div class="value" id="st-status" style="color:${status.up === true ? 'var(--green)' : status.up === false ? 'var(--red)' : 'var(--amber)'};font-size:18px">
             ${!host.enabled ? 'PAUSED' : status.up === true ? 'UP' : status.up === false ? 'DOWN' : 'UNKNOWN'}</div></div>
-        <div class="stat"><div class="label">Availability 24h</div>
-          <div class="value" id="st-avail24">${uptime.availability.availability_pct == null ? '—' : uptime.availability.availability_pct.toFixed(2) + '%'}</div></div>
+        <div class="stat"><div class="label">Availability ${esc(rangeLabel(state.hostRange || 24))}</div>
+          <div class="value" id="st-avail-range">${uptime.availability.availability_pct == null ? '—' : uptime.availability.availability_pct.toFixed(2) + '%'}</div></div>
         <div class="stat"><div class="label">Availability 7d</div>
           <div class="value" id="st-avail7d">${status.availability_7d.availability_pct == null ? '—' : status.availability_7d.availability_pct.toFixed(2) + '%'}</div></div>
         <div class="stat"><div class="label">Last check</div>
@@ -809,8 +822,16 @@ async function refreshHostStatus(id, host) {
     if (statusEl) statusEl.style.color = status.up === true ? 'var(--green)' : status.up === false ? 'var(--red)' : 'var(--amber)';
     const dot = document.getElementById('st-dot');
     if (dot) dot.innerHTML = hostStatusDot(status, host.enabled);
-    set('st-avail24', status.availability_24h.availability_pct == null ? '—' : status.availability_24h.availability_pct.toFixed(2) + '%');
     set('st-avail7d', status.availability_7d.availability_pct == null ? '—' : status.availability_7d.availability_pct.toFixed(2) + '%');
+    // The first card is labelled with the *selected* range, and /status only
+    // carries fixed 24h/7d windows -- so refresh it from the window the user
+    // picked. Writing status.availability_24h here silently overwrote the 7d
+    // or 30d figure 30 s after the page rendered it.
+    try {
+      const up = await api(`/api/hosts/${id}/uptime?hours=${state.hostRange || 24}`);
+      set('st-avail-range', up.availability.availability_pct == null
+        ? '—' : up.availability.availability_pct.toFixed(2) + '%');
+    } catch (e) { /* keep the value already on screen */ }
     set('st-lastcheck', fmtAgo(status.last_check));
     set('st-lastchange', status.last_change ? fmtTs(status.last_change, true) : '—');
   } catch (e) { /* ignore background refresh errors */ }
@@ -942,7 +963,9 @@ function bindHostActions(host, render) {
                <td><button class="small" data-walk-add="${esc(r.oid)}">Add</button></td></tr>`).join('')}</table>`
           : 'No rows returned.';
         out.querySelectorAll('[data-walk-add]').forEach((btn) => btn.addEventListener('click', async () => {
-          await api(`/api/hosts/${host.id}/oids`, { method: 'POST', body: { oid: btn.dataset.walkAdd, label: '' } });
+          try {
+            await api(`/api/hosts/${host.id}/oids`, { method: 'POST', body: { oid: btn.dataset.walkAdd, label: '' } });
+          } catch (e) { toast('Could not add OID: ' + e.message, 'error'); return; }
           btn.textContent = 'Added';
           btn.disabled = true;
           render();
@@ -953,7 +976,12 @@ function bindHostActions(host, render) {
   });
 
   $app.querySelectorAll('[data-del-oid]').forEach((btn) => btn.addEventListener('click', async () => {
-    await api(`/api/hosts/${host.id}/oids/${encodeURIComponent(btn.dataset.delOid)}`, { method: 'DELETE' });
+    // No try/catch here meant a 404/422/403 or an expired session rejected
+    // inside the listener: nothing rendered, no toast, no rollback -- the
+    // button simply did nothing.
+    try {
+      await api(`/api/hosts/${host.id}/oids/${encodeURIComponent(btn.dataset.delOid)}`, { method: 'DELETE' });
+    } catch (e) { toast('Could not remove OID: ' + e.message, 'error'); return; }
     toast('OID removed', 'success');
     render();
   }));
@@ -1322,7 +1350,9 @@ function renderSSHMain(hostId, hosts) {
   document.getElementById('ssh-connect').addEventListener('click', () => connectTerminal(hostId, host));
   const forget = document.getElementById('ssh-forget');
   if (forget) forget.addEventListener('click', async () => {
-    await api(`/api/hosts/${hostId}/ssh-credentials`, { method: 'DELETE' });
+    try {
+      await api(`/api/hosts/${hostId}/ssh-credentials`, { method: 'DELETE' });
+    } catch (e) { toast('Could not remove saved credentials: ' + e.message, 'error'); return; }
     toast('Saved credentials removed', 'success');
     viewSSH(hostId);
   });
