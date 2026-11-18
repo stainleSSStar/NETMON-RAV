@@ -723,9 +723,25 @@ def run_tests():
     by_id = {d["id"]: d for d in devices}
     check("devices lists every host", len(devices) >= 5, f"{len(devices)} devices")
     check("device carries address", by_id[host1["id"]]["address"] == "127.0.0.1")
-    check("device carries status",
-          by_id[host1["id"]]["up"] is True and by_id[host2["id"]]["up"] is False,
+    # host1 was switched to the ICMP method by the lifecycle test above, and
+    # raw ICMP is blocked on some machines (the reason the icmp checks skip).
+    # Assert the "up" side against a host whose probe answers everywhere.
+    up_host = host1 if ICMP_OK else host4
+    status_ok = (by_id[up_host["id"]]["up"] is True
+                 and by_id[host2["id"]]["up"] is False)
+    check("device carries status", status_ok,
           json.dumps({k: v.get("up") for k, v in by_id.items()}))
+    if not status_ok:
+        # A bare boolean says nothing about *why* a device reads down, so
+        # surface every device's poller detail plus host1's recent history.
+        for d in devices:
+            print(f"    [diag] device {d['id']} {d['name']!r} up={d.get('up')} "
+                  f"method={d.get('check_method')} enabled={d.get('enabled')} "
+                  f"detail={d.get('detail')!r}", flush=True)
+        for e in (s.get(BASE + f"/api/hosts/{host1['id']}/events", timeout=5)
+                   .json().get("events") or [])[-6:]:
+            print(f"    [diag] event {e.get('ts')} {e.get('type')}: {e.get('message')}",
+                  flush=True)
     check("device carries availability",
           by_id[host1["id"]]["availability_24h"]["availability_pct"] is not None)
     check("device carries oid counts",
